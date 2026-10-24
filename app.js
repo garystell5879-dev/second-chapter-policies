@@ -113,8 +113,12 @@
       <form id="proff" novalidate>
         <label for="nm">First name</label>
         <input id="nm" value="${esc(p.first_name)}" autocomplete="given-name" maxlength="30">
-        <label for="bd">Date of birth <span class="hint">(members must be ${C.minAge} or older)</span></label>
-        <input id="bd" type="date" value="${esc(p.birthdate)}" autocomplete="bday">
+        <div class="lbl" id="bdl">Date of birth <span class="hint">(members must be ${C.minAge} or older)</span></div>
+        <div class="dob" role="group" aria-labelledby="bdl">
+          <div><label for="bm" class="hint">Month</label><input id="bm" inputmode="numeric" pattern="[0-9]*" maxlength="2" placeholder="MM" autocomplete="bday-month" value="${p.birthdate ? +p.birthdate.slice(5, 7) : ""}"></div>
+          <div><label for="bdd" class="hint">Day</label><input id="bdd" inputmode="numeric" pattern="[0-9]*" maxlength="2" placeholder="DD" autocomplete="bday-day" value="${p.birthdate ? +p.birthdate.slice(8, 10) : ""}"></div>
+          <div><label for="by" class="hint">Year</label><input id="by" inputmode="numeric" pattern="[0-9]*" maxlength="4" placeholder="YYYY" autocomplete="bday-year" value="${p.birthdate ? p.birthdate.slice(0, 4) : ""}"></div>
+        </div>
         <div class="lbl" id="gl">I am a</div>
         <div class="seg" role="group" aria-labelledby="gl" data-field="gender">
           <button type="button" data-val="man"${sel(p.gender, "man")}>Man</button>
@@ -257,6 +261,13 @@
     }
   });
   document.addEventListener("input", e => {
+    const t = e.target;
+    if (t.id === "bm" || t.id === "bdd" || t.id === "by") {
+      t.value = t.value.replace(/\D/g, "");
+      const next = { bm: "bdd", bdd: "by" }[t.id];
+      if (next && t.value.length === 2) $(next).focus(); // jump to the next box
+      return;
+    }
     if (e.target.id === "bio") $("cnt").textContent = e.target.value.length + "/" + C.textLimit;
   });
 
@@ -307,12 +318,16 @@
 
     if (f.id === "proff") {
       const pick = name => { const b = f.querySelector(`[data-field="${name}"] [aria-pressed="true"]`); return b ? b.dataset.val : null; };
-      const first_name = $("nm").value.trim(), birthdate = $("bd").value, gender = pick("gender"), seeking = pick("seeking");
+      const bm = +$("bm").value, bdd = +$("bdd").value, by = +$("by").value;
+      const real = new Date(by, bm - 1, bdd);
+      const validDate = by >= 1900 && bm >= 1 && bm <= 12 && bdd >= 1 && real.getMonth() === bm - 1 && real.getDate() === bdd;
+      const birthdate = validDate ? `${by}-${String(bm).padStart(2, "0")}-${String(bdd).padStart(2, "0")}` : "";
+      const first_name = $("nm").value.trim(), gender = pick("gender"), seeking = pick("seeking");
       const loc = $("loc").value, bio = $("bio").value.trim();
       const city = loc === "__other" ? $("oc").value.trim() : loc, state = loc === "__other" ? $("os").value.trim() : "OK";
       const age = ageFrom(birthdate);
       if (!first_name) { err.textContent = "Enter your first name."; return; }
-      if (!birthdate || age === null || age > 110) { err.textContent = "Enter your date of birth."; return; }
+      if (!birthdate || age === null || age > 110) { err.textContent = "Enter your full date of birth, for example 5 / 14 / 1968."; return; }
       if (age < C.minAge) { err.textContent = "Second Chapter is for people " + C.minAge + " and over."; return; }
       if (!gender) { err.textContent = "Choose whether you're a man or a woman."; return; }
       if (!seeking) { err.textContent = "Choose who you're interested in."; return; }
