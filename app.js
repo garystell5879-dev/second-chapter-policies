@@ -1,7 +1,7 @@
 (function () {
   "use strict";
-  const C = window.SC_CONFIG, Q = window.SC_QUESTIONS, LOC = window.SC_LOCATIONS;
-  const app = document.getElementById("app"), nav = document.getElementById("nav");
+  const C = window.SC_CONFIG, Q = window.SC_QUESTIONS, LOC = window.SC_LOCATIONS, SAMPLES = window.SC_SAMPLES || [];
+  const app = document.getElementById("app"), nav = document.getElementById("nav"), tabs = document.getElementById("tabs");
 
   if (!window.supabase) {
     app.innerHTML = '<div class="msg">We couldn\'t load the sign-in service. Check your connection and refresh the page.</div>';
@@ -9,16 +9,18 @@
   }
   const sb = window.supabase.createClient(C.supabaseUrl, C.supabaseKey);
 
-  let session = null, profile = null, quiz = null, recovering = false;
+  let session = null, profile = null, quiz = null, recovering = false, renderId = 0, chatChannel = null, chatPoll = null, unread = 0;
 
   // ---------- helpers ----------
   const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const $ = id => document.getElementById(id);
   const route = () => (location.hash.replace(/^#\/?/, "").split("?")[0] || "");
-  const go = r => { if (route() === r) render(); else location.hash = "#/" + r; };
+  const param = k => new URLSearchParams(location.hash.split("?")[1] || "").get(k);
+  const go = r => { if (location.hash === "#/" + r) render(); else location.hash = "#/" + r; };
+  const store = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} } };
   function toast(t) {
     const e = document.createElement("div"); e.className = "toast"; e.setAttribute("role", "status"); e.textContent = t;
-    document.body.appendChild(e); setTimeout(() => e.remove(), 2400);
+    document.body.appendChild(e); setTimeout(() => e.remove(), 2600);
   }
   function busy(btn, on, label) {
     if (!btn) return;
@@ -32,9 +34,17 @@
     if (n.getMonth() < b.getMonth() || (n.getMonth() === b.getMonth() && n.getDate() < b.getDate())) a--;
     return a;
   }
+  const fmtDate = d => new Date(d).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
+  const fmtTime = d => {
+    const t = new Date(d), today = new Date().toDateString() === t.toDateString();
+    return today ? t.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }) : t.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  };
   const answered = () => quiz ? Q.filter(q => quiz.answers && quiz.answers[q.id]).length : 0;
-  const profileDone = () => !!(profile && profile.first_name && profile.birthdate && profile.gender && profile.seeking && profile.city && profile.state && profile.bio);
+  const profileDone = () => !!(profile && profile.completed_at);
   const quizDone = () => !!(quiz && quiz.completed_at);
+  const isAdmin = () => !!(profile && profile.is_admin);
+  const isFounder = () => !!(profile && profile.founder_number);
+  const memberActive = () => !!(profile && (isAdmin() || (profile.founder_free_until && new Date(profile.founder_free_until) > new Date()) || (profile.paid_until && new Date(profile.paid_until) > new Date())));
   const friendly = e => {
     const m = (e && e.message) || "";
     if (/invalid login/i.test(m)) return "Email or password is incorrect. Check both and try again.";
@@ -42,9 +52,60 @@
     if (/email not confirmed/i.test(m)) return "Please confirm your email first. Check your inbox for the link we sent.";
     if (/rate limit/i.test(m)) return "Too many attempts in a short time. Wait a few minutes and try again.";
     if (/password/i.test(m)) return m;
-    return "Something went wrong on our end. Please try again." + (m ? " (" + m + ")" : "");
+    return "Something went wrong on our end. Please try again.";
   };
+  const HEART = '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 3 4.5 6.7 4.5c2.1 0 3.6 1.2 4.3 2.4.7-1.2 2.2-2.4 4.3-2.4 3.7 0 5.8 3.9 4.3 7.3C19.5 16.4 12 21 12 21z"/></svg>';
 
+  // ---------- photos ----------
+  const urlCache = {};
+  async function photoUrl(path) {
+    if (!path) return null;
+    if (path.startsWith("samples/")) return path;
+    const hit = urlCache[path];
+    if (hit && hit.exp > Date.now()) return hit.url;
+    const { data, error } = await sb.storage.from("photos").createSignedUrl(path, 3600);
+    if (error || !data) return null;
+    urlCache[path] = { url: data.signedUrl, exp: Date.now() + 50 * 60 * 1000 };
+    return data.signedUrl;
+  }
+  // Fill every [data-photo] placeholder on the page with its picture.
+  function hydratePhotos(root) {
+    (root || document).querySelectorAll("[data-photo]").forEach(async el => {
+      const path = el.dataset.photo; el.removeAttribute("data-photo");
+      const url = await photoUrl(path);
+      if (url) { const img = new Image(); img.alt = ""; img.src = url; img.onload = () => { el.innerHTML = ""; el.appendChild(img); }; }
+    });
+  }
+  // Round portrait. Founders get the crimson ring, gold ring and crimson sickle with the golden SC.
+  function avatar(c, size, opts) {
+    opts = opts || {};
+    const initial = esc((c.first_name || c.name || "?").charAt(0));
+    const inner = `<div class="ph${opts.sample ? " sample" : ""}" ${c.photo_path ? `data-photo="${esc(c.photo_path)}"` : ""}><span>${initial}</span></div>`;
+    if (!c.founder) return `<div class="av" style="--s:${size}px">${inner}</div>`;
+    return `<div class="av fb" style="--s:${size}px" title="Founding member">${inner}${badgeSvg()}</div>`;
+  }
+  function badgeSvg() {
+    return `<svg class="badge" viewBox="0 0 120 132" aria-hidden="true">
+      <circle cx="60" cy="60" r="49" fill="none" stroke="#b0122b" stroke-width="6"/>
+      <circle cx="60" cy="60" r="55.5" fill="none" stroke="#f2c230" stroke-width="5"/>
+      <path d="M18 92 Q60 140 102 92 Q60 122 18 92 Z" fill="#b0122b" stroke="#f2c230" stroke-width="1.5" stroke-linejoin="round"/>
+      <circle cx="60" cy="117" r="13.5" fill="#b0122b" stroke="#f2c230" stroke-width="2.5"/>
+      <text x="60" y="122" text-anchor="middle" font-family="Cormorant Garamond, Georgia, serif" font-weight="700" font-size="14" fill="#f2c230">SC</text>
+    </svg>`;
+  }
+  async function resizeImage(file) {
+    const url = URL.createObjectURL(file);
+    try {
+      const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
+      const max = 1080, scale = Math.min(1, max / Math.max(img.width, img.height));
+      const cv = document.createElement("canvas");
+      cv.width = Math.round(img.width * scale); cv.height = Math.round(img.height * scale);
+      cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
+      return await new Promise(res => cv.toBlob(res, "image/jpeg", 0.85));
+    } finally { URL.revokeObjectURL(url); }
+  }
+
+  // ---------- data ----------
   async function loadMine() {
     if (!session) { profile = null; quiz = null; return; }
     const uid = session.user.id;
@@ -55,147 +116,356 @@
     profile = p.data || null;
     quiz = q.data || { user_id: uid, answers: {}, completed_at: null };
   }
-
-  // ---------- nav ----------
-  function renderNav() {
-    nav.innerHTML = session
-      ? '<a href="#/home">My page</a><a href="#/profile">Profile</a><button type="button" data-act="out">Sign out</button>'
-      : '<a href="#/signin">Sign in</a>';
+  async function refreshUnread() {
+    if (!session || !profileDone()) { unread = 0; return; }
+    const { data } = await sb.rpc("my_matches");
+    unread = (data || []).reduce((n, m) => n + (+m.unread || 0), 0);
+    renderTabs();
   }
 
-  // ---------- views ----------
-  const views = {
-    "": () => `
-      <section class="hero">
-        <p class="eyebrow">Now forming in the Tulsa area</p>
-        <h1>Fewer introductions. Better ones.</h1>
-        <p class="lead">Second Chapter is matchmaking for singles 40 and over. No swiping and no endless feed, just a few people chosen for you each day.</p>
-      </section>
-      <ol class="steps">
-        <li>Create your profile and answer 20 questions about what matters to you.</li>
-        <li>Every 24 hours, our matching chooses five people for you.</li>
-        <li>Missed a day? Up to five past matches wait in your match cart.</li>
-        <li>When you both say yes, messaging opens for the two of you.</li>
-      </ol>
-      <div class="founder"><strong>Founding members:</strong> the first 100 people to complete a profile get their first two months free.</div>
-      <div class="row"><a class="btn" href="#/signup">Create your profile</a><a class="btn ghost" href="#/signin">Sign in</a></div>
-      <h3>Membership</h3>
-      <div class="price"><div><strong>$9.99</strong>per week</div><div><strong>$36</strong>per month</div></div>
-      <p class="hint">Cancel anytime. See <a href="pricing.html">pricing</a> and <a href="refunds.html">refunds</a>.</p>`,
+  // Count visits (no outside tracking service). One random id per browser.
+  const logged = new Set();
+  function logVisit(r) {
+    const key = r || "home";
+    if (logged.has(key)) return; logged.add(key);
+    let v = store.get("sc_v");
+    if (!v) { v = Math.random().toString(36).slice(2) + Date.now().toString(36); store.set("sc_v", v); }
+    sb.from("visits").insert({ visitor: v.slice(0, 40), path: key.slice(0, 80) }).then(() => {}, () => {});
+  }
 
-    signup: () => authForm("up"),
-    signin: () => authForm("in"),
+  // ---------- navigation ----------
+  function renderNav() {
+    nav.innerHTML = session ? "" : '<a href="#/signin">Sign in</a>';
+    renderTabs();
+  }
+  function renderTabs() {
+    const show = session && !recovering;
+    document.body.classList.toggle("has-tabs", !!show);
+    if (!show) { tabs.innerHTML = ""; return; }
+    const r = route(), on = x => (r === x || (x === "matches" && r === "chat")) ? ' aria-current="page"' : "";
+    tabs.innerHTML = `
+      <a href="#/home"${on("home")}><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 3l9 8h-3v9h-5v-6h-2v6H6v-9H3z"/></svg>Today</a>
+      <a href="#/matches"${on("matches")}>${HEART}Matches${unread ? `<b class="dot">${unread}</b>` : ""}</a>
+      <a href="#/profile"${on("profile")}><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 12a4.5 4.5 0 1 0 0-9 4.5 4.5 0 0 0 0 9zm0 2c-4.4 0-8 2.2-8 5v2h16v-2c0-2.8-3.6-5-8-5z"/></svg>Profile</a>
+      ${isAdmin() ? `<a href="#/admin"${on("admin")}><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 20V10h3v10zm6.5 0V4h3v16zM17 20v-7h3v7z"/></svg>Admin</a>` : ""}`;
+  }
 
-    forgot: () => `
-      <h2>Reset your password</h2>
-      <p class="sub">We'll email you a link to choose a new one.</p>
-      <form id="forgotf" novalidate>
-        <label for="em">Email</label><input id="em" type="email" autocomplete="email" required>
-        <p class="err" id="err" role="alert"></p>
-        <div class="row"><button class="btn" type="submit">Send reset link</button><a class="btn ghost" href="#/signin">Back to sign in</a></div>
-      </form>`,
+  // ---------- views (return HTML, or a promise of HTML) ----------
+  const views = {};
 
-    newpass: () => `
-      <h2>Choose a new password</h2>
-      <form id="newpassf" novalidate>
-        <label for="pw">New password <span class="hint">(at least 8 characters)</span></label>
-        <input id="pw" type="password" autocomplete="new-password" required>
-        <p class="err" id="err" role="alert"></p>
-        <div class="row"><button class="btn" type="submit">Save password</button></div>
-      </form>`,
+  views[""] = () => `
+    <section class="hero">
+      <p class="eyebrow">Now forming in the Tulsa area</p>
+      <h1>Fewer introductions. Better ones.</h1>
+      <p class="lead">Second Chapter is matchmaking for singles 40 and over. No swiping and no endless feed, just a few people chosen for you each day.</p>
+    </section>
+    <ol class="steps">
+      <li>Create your profile and answer 20 questions about what matters to you.</li>
+      <li>Every 24 hours, our matching chooses five people for you.</li>
+      <li>Missed a day? Up to five past matches wait in your match cart.</li>
+      <li>When you both say yes, messaging opens for the two of you.</li>
+    </ol>
+    <div class="founder"><div class="founder-row">${avatar({ first_name: "S", founder: true }, 64, { sample: true })}<div><strong>Founding members</strong><br>The first 100 people to complete a profile get two months free and a founder's badge.<span id="spots"></span></div></div></div>
+    <div class="row"><a class="btn" href="#/signup">Create your profile</a><a class="btn ghost" href="#/signin">Sign in</a></div>
+    <h3>What an introduction looks like</h3>
+    <p class="hint" style="margin-top:0">These are sample profiles, not real members.</p>
+    <div class="samples">${SAMPLES.map(s => `
+      <article class="card intro sample-card">
+        <div class="who">${avatar({ first_name: s.name, photo_path: s.photo || null }, 72, { sample: true })}
+          <div><h4>${esc(s.name)}, ${s.age}</h4><p class="meta">${esc(s.city)}</p></div>
+          <span class="score">${s.score}%</span></div>
+        <p class="bio">${esc(s.bio)}</p>
+        <span class="tag">Sample profile</span>
+      </article>`).join("")}</div>
+    <h3>Membership</h3>
+    <div class="price"><div><strong>$9.99</strong>per week</div><div><strong>$36</strong>per month</div></div>
+    <p class="hint">Cancel anytime. See <a href="pricing.html">pricing</a> and <a href="refunds.html">refunds</a>.</p>`;
+  views[""].after = async () => {
+    hydratePhotos();
+    const { data } = await sb.rpc("founder_spots_left");
+    if (typeof data === "number" && $("spots")) $("spots").textContent = data > 0 ? ` ${data} of 100 spots left.` : " All 100 founder spots are taken.";
+  };
 
-    profile: () => {
-      const p = profile || {}, other = p.city && !LOC.includes(p.city);
-      const sel = (v, x) => v === x ? ' aria-pressed="true"' : ' aria-pressed="false"';
-      return `
-      <h2>${profileDone() ? "Your profile" : "Tell us about you"}</h2>
-      <p class="sub">Only your first name, age, town and bio are shown to your matches.</p>
-      <form id="proff" novalidate>
-        <label for="nm">First name</label>
-        <input id="nm" value="${esc(p.first_name)}" autocomplete="given-name" maxlength="30">
-        <div class="lbl" id="bdl">Date of birth <span class="hint">(members must be ${C.minAge} or older)</span></div>
-        <div class="dob" role="group" aria-labelledby="bdl">
-          <div><label for="bm" class="hint">Month</label><input id="bm" inputmode="numeric" pattern="[0-9]*" maxlength="2" placeholder="MM" autocomplete="bday-month" value="${p.birthdate ? +p.birthdate.slice(5, 7) : ""}"></div>
-          <div><label for="bdd" class="hint">Day</label><input id="bdd" inputmode="numeric" pattern="[0-9]*" maxlength="2" placeholder="DD" autocomplete="bday-day" value="${p.birthdate ? +p.birthdate.slice(8, 10) : ""}"></div>
-          <div><label for="by" class="hint">Year</label><input id="by" inputmode="numeric" pattern="[0-9]*" maxlength="4" placeholder="YYYY" autocomplete="bday-year" value="${p.birthdate ? p.birthdate.slice(0, 4) : ""}"></div>
-        </div>
-        <div class="lbl" id="gl">I am a</div>
-        <div class="seg" role="group" aria-labelledby="gl" data-field="gender">
-          <button type="button" data-val="man"${sel(p.gender, "man")}>Man</button>
-          <button type="button" data-val="woman"${sel(p.gender, "woman")}>Woman</button>
-        </div>
-        <div class="lbl" id="sl">Interested in</div>
-        <div class="seg" role="group" aria-labelledby="sl" data-field="seeking">
-          <button type="button" data-val="men"${sel(p.seeking, "men")}>Men</button>
-          <button type="button" data-val="women"${sel(p.seeking, "women")}>Women</button>
-          <button type="button" data-val="everyone"${sel(p.seeking, "everyone")}>Everyone</button>
-        </div>
-        <label for="loc">Where do you live?</label>
-        <select id="loc">
-          <option value="">Choose your town</option>
-          <optgroup label="Tulsa area">${LOC.map(c => `<option${p.city === c ? " selected" : ""}>${esc(c)}</option>`).join("")}</optgroup>
-          <option value="__other"${other ? " selected" : ""}>Somewhere else</option>
-        </select>
-        <div id="otherloc" ${other ? "" : "hidden"}>
-          <p class="hint">We're starting in Tulsa, but you're welcome to join now. We'll introduce you as members join near you.</p>
-          <div class="price" style="margin:0">
-            <div style="padding:0;border:0;background:none"><label for="oc" style="margin-top:0">City</label><input id="oc" maxlength="80" value="${other ? esc(p.city) : ""}" autocomplete="address-level2"></div>
-            <div style="padding:0;border:0;background:none"><label for="os" style="margin-top:0">State</label><input id="os" maxlength="40" value="${other ? esc(p.state) : ""}" autocomplete="address-level1"></div>
-          </div>
-        </div>
-        <label for="bio">A short bio</label>
-        <textarea id="bio" maxlength="${C.textLimit}" placeholder="A few lines about you and what a good day looks like.">${esc(p.bio)}</textarea>
-        <div class="count" id="cnt">${(p.bio || "").length}/${C.textLimit}</div>
-        <p class="err" id="err" role="alert"></p>
-        <div class="row"><button class="btn" type="submit">${profileDone() ? "Save changes" : "Save and continue"}</button></div>
-      </form>`;
-    },
-
-    questions: () => {
-      const a = (quiz && quiz.answers) || {};
-      let i = +(new URLSearchParams(location.hash.split("?")[1] || "").get("q") || 0);
-      if (!(i >= 1 && i <= Q.length)) { const f = Q.findIndex(q => !a[q.id]); i = (f < 0 ? Q.length - 1 : f) + 1; }
-      const q = Q[i - 1], n = answered();
-      return `
-      <p class="qnum">Question ${i} of ${Q.length} · ${n} answered</p>
-      <div class="bar" aria-hidden="true"><span style="width:${(n / Q.length) * 100}%"></span></div>
-      <h2 class="qtext" id="qt">${esc(q.text)}</h2>
-      <div class="opts" role="group" aria-labelledby="qt">
-        ${q.options.map(([id, t]) => `<button type="button" data-ans="${q.id}:${id}" data-i="${i}" aria-pressed="${a[q.id] === id}">${esc(t)}</button>`).join("")}
-      </div>
+  views.signup = () => authForm("up");
+  views.signin = () => authForm("in");
+  views.forgot = () => `
+    <h2>Reset your password</h2>
+    <p class="sub">We'll email you a link to choose a new one.</p>
+    <form id="forgotf" novalidate>
+      <label for="em">Email</label><input id="em" type="email" autocomplete="email" required>
       <p class="err" id="err" role="alert"></p>
-      <div class="row">
-        ${i > 1 ? `<a class="btn ghost" href="#/questions?q=${i - 1}">Back</a>` : ""}
-        ${a[q.id] && i < Q.length ? `<a class="btn ghost" href="#/questions?q=${i + 1}">Next</a>` : ""}
-        <a class="btn ghost" href="#/home">Finish later</a>
-      </div>`;
-    },
+      <div class="row"><button class="btn" type="submit">Send reset link</button><a class="btn ghost" href="#/signin">Back to sign in</a></div>
+    </form>`;
+  views.newpass = () => `
+    <h2>Choose a new password</h2>
+    <form id="newpassf" novalidate>
+      <label for="pw">New password <span class="hint">(at least 8 characters)</span></label>
+      <input id="pw" type="password" autocomplete="new-password" required>
+      <p class="err" id="err" role="alert"></p>
+      <div class="row"><button class="btn" type="submit">Save password</button></div>
+    </form>`;
 
-    home: () => {
-      const n = answered(), pd = profileDone(), qd = quizDone();
-      const away = profile && profile.state && !/^(ok|oklahoma)$/i.test(profile.state.trim());
-      return `
+  views.profile = () => {
+    const p = profile || {}, other = p.city && !LOC.includes(p.city);
+    const sel = (v, x) => v === x ? ' aria-pressed="true"' : ' aria-pressed="false"';
+    return `
+    <h2>${profileDone() ? "Your profile" : "Tell us about you"}</h2>
+    <p class="sub">Your matches see your photo, first name, age, town and bio. Never your email or birthday.</p>
+    ${isFounder() ? `<div class="founder"><strong>Founding member #${p.founder_number}.</strong> Your membership is free until ${fmtDate(p.founder_free_until)}.</div>` : ""}
+    <div class="photo-edit">
+      <div id="myphoto">${avatar({ first_name: p.first_name || "+", photo_path: p.photo_path, founder: isFounder() }, 120)}</div>
+      <div>
+        <label class="btn ghost file" for="photoin">${p.photo_path ? "Change photo" : "Add your photo"}</label>
+        <input id="photoin" type="file" accept="image/*" hidden>
+        <p class="hint" id="photomsg">A clear, recent photo of just you, face visible.</p>
+      </div>
+    </div>
+    <form id="proff" novalidate>
+      <label for="nm">First name</label>
+      <input id="nm" value="${esc(p.first_name)}" autocomplete="given-name" maxlength="30">
+      <div class="lbl" id="bdl">Date of birth <span class="hint">(members must be ${C.minAge} or older)</span></div>
+      <div class="dob" role="group" aria-labelledby="bdl">
+        <div><label for="bm" class="hint">Month</label><input id="bm" inputmode="numeric" pattern="[0-9]*" maxlength="2" placeholder="MM" autocomplete="bday-month" value="${p.birthdate ? +p.birthdate.slice(5, 7) : ""}"></div>
+        <div><label for="bdd" class="hint">Day</label><input id="bdd" inputmode="numeric" pattern="[0-9]*" maxlength="2" placeholder="DD" autocomplete="bday-day" value="${p.birthdate ? +p.birthdate.slice(8, 10) : ""}"></div>
+        <div><label for="by" class="hint">Year</label><input id="by" inputmode="numeric" pattern="[0-9]*" maxlength="4" placeholder="YYYY" autocomplete="bday-year" value="${p.birthdate ? p.birthdate.slice(0, 4) : ""}"></div>
+      </div>
+      <div class="lbl" id="gl">I am a</div>
+      <div class="seg" role="group" aria-labelledby="gl" data-field="gender">
+        <button type="button" data-val="man"${sel(p.gender, "man")}>Man</button>
+        <button type="button" data-val="woman"${sel(p.gender, "woman")}>Woman</button>
+      </div>
+      <div class="lbl" id="sl">Interested in</div>
+      <div class="seg" role="group" aria-labelledby="sl" data-field="seeking">
+        <button type="button" data-val="men"${sel(p.seeking, "men")}>Men</button>
+        <button type="button" data-val="women"${sel(p.seeking, "women")}>Women</button>
+        <button type="button" data-val="everyone"${sel(p.seeking, "everyone")}>Everyone</button>
+      </div>
+      <label for="loc">Where do you live?</label>
+      <select id="loc">
+        <option value="">Choose your town</option>
+        <optgroup label="Tulsa area">${LOC.map(c => `<option${p.city === c ? " selected" : ""}>${esc(c)}</option>`).join("")}</optgroup>
+        <option value="__other"${other ? " selected" : ""}>Somewhere else</option>
+      </select>
+      <div id="otherloc" ${other ? "" : "hidden"}>
+        <p class="hint">We're starting in Tulsa, but you're welcome to join now. We'll introduce you as members join near you.</p>
+        <div class="two">
+          <div><label for="oc" style="margin-top:0">City</label><input id="oc" maxlength="80" value="${other ? esc(p.city) : ""}" autocomplete="address-level2"></div>
+          <div><label for="os" style="margin-top:0">State</label><input id="os" maxlength="40" value="${other ? esc(p.state) : ""}" autocomplete="address-level1"></div>
+        </div>
+      </div>
+      <label for="bio">A short bio</label>
+      <textarea id="bio" maxlength="${C.textLimit}" placeholder="A few lines about you and what a good day looks like.">${esc(p.bio)}</textarea>
+      <div class="count" id="cnt">${(p.bio || "").length}/${C.textLimit}</div>
+      <p class="err" id="err" role="alert"></p>
+      <div class="row"><button class="btn" type="submit">${profileDone() ? "Save changes" : "Save and continue"}</button></div>
+    </form>
+    <div class="account">
+      <p class="hint">Signed in as ${esc(session.user.email)}</p>
+      <div class="row"><button type="button" class="btn ghost" data-act="out">Sign out</button></div>
+      ${quizDone() ? '<p><a href="#/questions?q=1">Review your 20 answers</a></p>' : ""}
+      <p><button type="button" class="linkbtn danger" data-act="delete">Delete my account</button></p>
+    </div>`;
+  };
+  views.profile.after = () => hydratePhotos();
+
+  views.membership = () => {
+    const p = profile || {};
+    if (isFounder() && memberActive()) return `
+      <h2>You're a founding member</h2>
+      <div class="founder-row big">${avatar({ first_name: p.first_name, photo_path: p.photo_path, founder: true }, 110)}
+        <div><strong>Founder #${p.founder_number}</strong><br>Free until ${fmtDate(p.founder_free_until)}</div></div>
+      <p>Your badge shows on your profile to everyone you're introduced to. After your free months, membership is $9.99 a week or $36 a month, and you'll add a payment method then.</p>
+      <div class="row"><a class="btn" href="#/${quizDone() ? "home" : "questions"}">${quizDone() ? "Back to today" : "Continue to the 20 questions"}</a></div>`;
+    const lapsed = (p.founder_free_until || p.paid_until) && !memberActive();
+    return `
+      <h2>${lapsed ? "Renew your membership" : "Choose your membership"}</h2>
+      <p class="sub">${lapsed ? "Your membership has ended. Renew to keep getting introductions." : "All 100 founder spots have been claimed. Membership unlocks the 20 questions and your daily introductions."}</p>
+      <div class="plans">
+        <div class="card plan"><strong>$9.99</strong><span>per week</span><button class="btn" disabled>Coming soon</button></div>
+        <div class="card plan best"><em>Best value</em><strong>$36</strong><span>per month</span><button class="btn" disabled>Coming soon</button></div>
+      </div>
+      <div class="msg">Online payment is opening shortly. Your profile is saved, so you can come back and pick up right here.</div>
+      <p class="hint">Cancel anytime. No refunds for partial periods. See <a href="pricing.html">pricing</a> and <a href="refunds.html">refunds</a>.</p>
+      ${p.paid_until ? `<p class="hint">Paid through ${fmtDate(p.paid_until)}.</p>` : ""}`;
+  };
+  views.membership.after = () => hydratePhotos();
+
+  views.questions = () => {
+    const a = (quiz && quiz.answers) || {};
+    let i = +(param("q") || 0);
+    if (!(i >= 1 && i <= Q.length)) { const f = Q.findIndex(q => !a[q.id]); i = (f < 0 ? Q.length - 1 : f) + 1; }
+    const q = Q[i - 1], n = answered();
+    return `
+    <p class="qnum">Question ${i} of ${Q.length} · ${n} answered</p>
+    <div class="bar" aria-hidden="true"><span style="width:${(n / Q.length) * 100}%"></span></div>
+    <h2 class="qtext" id="qt">${esc(q.text)}</h2>
+    <div class="opts" role="group" aria-labelledby="qt">
+      ${q.options.map(([id, t]) => `<button type="button" data-ans="${q.id}:${id}" data-i="${i}" aria-pressed="${a[q.id] === id}">${esc(t)}</button>`).join("")}
+    </div>
+    <p class="err" id="err" role="alert"></p>
+    <div class="row">
+      ${i > 1 ? `<a class="btn ghost" href="#/questions?q=${i - 1}">Back</a>` : ""}
+      ${a[q.id] && i < Q.length ? `<a class="btn ghost" href="#/questions?q=${i + 1}">Next</a>` : ""}
+      <a class="btn ghost" href="#/home">Finish later</a>
+    </div>`;
+  };
+
+  function setupSteps() {
+    const n = answered(), pd = profileDone(), ma = memberActive(), qd = quizDone();
+    const step = (title, sub, done, href, label, enabled) => `
+      <div class="card check"><div><strong>${title}</strong>${sub ? `<div class="st">${sub}</div>` : ""}</div>
+      ${done ? '<span class="st done">Done ✓</span>' : `<a class="btn${enabled ? "" : " ghost"}" href="${href}">${label}</a>`}</div>`;
+    return `
       <h2>Hello${profile && profile.first_name ? ", " + esc(profile.first_name) : ""}</h2>
-      <p class="sub">${pd && qd ? "You're all set." : "Two steps and you're ready for introductions."}</p>
-      <div class="card check"><div><strong>Your profile</strong></div>
-        ${pd ? '<span class="st done">Done ✓</span>' : '<a class="btn" href="#/profile">Start</a>'}</div>
-      <div class="card check"><div><strong>The 20 questions</strong><div class="st">${n} of ${Q.length} answered</div></div>
-        ${qd ? '<span class="st done">Done ✓</span>' : `<a class="btn${pd ? "" : " ghost"}" href="#/questions">${n ? "Continue" : "Start"}</a>`}</div>
-      ${pd && qd ? `<div class="msg"><strong>What happens next:</strong> your first five introductions arrive when matching opens${away ? ". We're starting in the Tulsa area, so we'll introduce you as members join near you" : " in the Tulsa area"}. We'll email you at ${esc(session.user.email)}.</div>
-        <p class="hint">You can change your answers anytime: <a href="#/questions?q=1">review the 20 questions</a>.</p>` : ""}`;
+      <p class="sub">A few steps and you're ready for introductions.</p>
+      ${step("Your profile and photo", "", pd, "#/profile", profile ? "Finish" : "Start", true)}
+      ${step("Membership", isFounder() ? `Founder #${profile.founder_number}, free for 2 months` : (pd ? "" : "Founder spots are claimed when your profile is complete"), pd && ma, "#/membership", "Choose", pd)}
+      ${step("The 20 questions", `${n} of ${Q.length} answered`, qd, "#/questions", n ? "Continue" : "Start", pd && ma)}`;
+  }
+
+  views.home = async () => {
+    if (!profileDone() || !memberActive() || !quizDone()) {
+      if (profileDone() && !memberActive() && quizDone()) return views.membership();
+      return setupSteps();
     }
+    const { data, error } = await sb.rpc("my_introductions");
+    if (error) return `<div class="msg">We couldn't load your introductions. Pull down to refresh, or try again in a minute.</div>`;
+    const today = data.filter(x => x.section === "today" && x.card), cart = data.filter(x => x.section === "cart" && x.card);
+    const away = profile.state && !/^(ok|oklahoma)$/i.test(profile.state.trim());
+    const empty = `<div class="card"><h4>No new introductions today</h4><p>${away
+      ? "We're starting in the Tulsa area. As members join near you, your introductions will start arriving here."
+      : "We pick people who fit your answers, so some days there are fewer. New introductions arrive every morning."}</p></div>`;
+    return `
+      <h2>Today's introductions</h2>
+      <p class="sub">${today.length ? "Chosen for you this morning. Take your time." : "New introductions arrive every morning."}</p>
+      ${today.length ? today.map(introCard).join("") : empty}
+      ${cart.length ? `<h3>Your match cart</h3><p class="hint" style="margin-top:0">Introductions from earlier days you haven't answered yet. The cart holds 5.</p>${cart.map(introCard).join("")}` : ""}`;
+  };
+  views.home.after = () => hydratePhotos();
+
+  function introCard(x) {
+    const c = x.card;
+    const actions = x.status === "new" ? `
+        <div class="row"><button class="btn" data-yes="${x.intro_id}">I'm interested</button><button class="btn ghost" data-pass="${x.intro_id}">Pass</button></div>`
+      : x.status === "interested" ? `<p class="ok">You said yes. If ${esc(c.first_name)} says yes too, messaging opens.</p>`
+      : `<p class="hint">You passed.</p>`;
+    return `
+      <article class="card intro${x.status === "passed" ? " faded" : ""}" id="i${x.intro_id}">
+        ${x.glinted_me ? `<p class="glinted">${HEART} ${esc(c.first_name)} sent you a glint</p>` : ""}
+        <div class="who">${avatar(c, 84)}
+          <div><h4>${esc(c.first_name)}, ${c.age}</h4><p class="meta">${esc(c.city)}${c.founder ? " · Founding member" : ""}</p></div>
+          <span class="score" title="How well your answers fit">${x.score}%</span></div>
+        <p class="bio">${esc(c.bio)}</p>
+        ${actions}
+        <div class="minor">
+          ${x.status !== "passed" ? (x.i_glinted ? `<span class="hint">${HEART} Glint sent</span>` : `<button type="button" class="linkbtn glint" data-glint="${c.id}" data-name="${esc(c.first_name)}">${HEART} Send a glint</button>`) : "<span></span>"}
+          <button type="button" class="linkbtn" data-report="${c.id}" data-name="${esc(c.first_name)}">Report</button>
+        </div>
+      </article>`;
+  }
+
+  views.matches = async () => {
+    const { data, error } = await sb.rpc("my_matches");
+    if (error) return `<div class="msg">We couldn't load your matches. Try again in a minute.</div>`;
+    unread = data.reduce((n, m) => n + (+m.unread || 0), 0);
+    return `
+      <h2>Your matches</h2>
+      <p class="sub">When you and someone both say yes, you can message each other here.</p>
+      ${data.length ? data.filter(m => m.card).map(m => `
+        <a class="card matchrow" href="#/chat?m=${m.match_id}">
+          ${avatar(m.card, 56)}
+          <div class="mid"><strong>${esc(m.card.first_name)}</strong><span>${m.last ? esc(m.last) : "Say hello"}</span></div>
+          <div class="end"><small>${fmtTime(m.last_at)}</small>${+m.unread ? `<b class="dot">${m.unread}</b>` : ""}</div>
+        </a>`).join("") : `<div class="card"><h4>No matches yet</h4><p>When you say yes to an introduction and they say yes too, they'll show up here.</p><div class="row"><a class="btn" href="#/home">See today's introductions</a></div></div>`}`;
+  };
+  views.matches.after = () => { hydratePhotos(); renderTabs(); };
+
+  views.chat = async () => {
+    const mid = +param("m");
+    const { data } = await sb.rpc("my_matches");
+    const m = (data || []).find(x => x.match_id === mid);
+    if (!m || !m.card) return `<div class="msg">This conversation isn't available anymore.</div><div class="row"><a class="btn" href="#/matches">Back to matches</a></div>`;
+    const c = m.card;
+    return `
+      <div class="chathead"><a href="#/matches" class="back" aria-label="Back to matches">‹</a>${avatar(c, 44)}<div><strong>${esc(c.first_name)}, ${c.age}</strong><span class="hint">${esc(c.city)}</span></div>
+        <details class="menu"><summary aria-label="More options">•••</summary><div>
+          <button type="button" data-unmatch="${mid}" data-name="${esc(c.first_name)}">Unmatch</button>
+          <button type="button" data-report="${c.id}" data-name="${esc(c.first_name)}">Report ${esc(c.first_name)}</button>
+        </div></details></div>
+      <div class="booth card"><strong>Photo booth</strong><span class="hint">Coming soon: describe a scene and get a picture of the two of you together.</span></div>
+      <div id="msgs" class="msgs" aria-live="polite"><p class="hint">Loading…</p></div>
+      <form id="sendf" class="sendf" data-m="${mid}" novalidate>
+        <label for="body" class="sr">Message</label>
+        <textarea id="body" maxlength="${C.textLimit}" rows="2" placeholder="Write a message"></textarea>
+        <div class="sendrow"><span class="count" id="cnt">0/${C.textLimit}</span><button class="btn" type="submit">Send</button></div>
+        <p class="err" id="err" role="alert"></p>
+      </form>`;
+  };
+  views.chat.after = async () => {
+    hydratePhotos();
+    const mid = +param("m"); if (!$("msgs")) return;
+    await loadMessages(mid);
+    stopChat();
+    chatChannel = sb.channel("m" + mid).on("postgres_changes", { event: "INSERT", schema: "public", table: "messages", filter: "match_id=eq." + mid }, () => loadMessages(mid)).subscribe();
+    chatPoll = setInterval(() => { if (route() === "chat") loadMessages(mid); }, 15000);
+  };
+  function stopChat() {
+    if (chatChannel) { sb.removeChannel(chatChannel); chatChannel = null; }
+    if (chatPoll) { clearInterval(chatPoll); chatPoll = null; }
+  }
+  async function loadMessages(mid) {
+    const box = $("msgs"); if (!box) return;
+    const { data, error } = await sb.from("messages").select("id,sender_id,body,created_at").eq("match_id", mid).order("created_at", { ascending: true }).limit(500);
+    if (error) { box.innerHTML = '<p class="hint">Messages couldn\'t load. Check your connection.</p>'; return; }
+    const me = session.user.id, atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+    box.innerHTML = data.length ? data.map(x => `<div class="bubble${x.sender_id === me ? " mine" : ""}"><p>${esc(x.body)}</p><small>${fmtTime(x.created_at)}</small></div>`).join("")
+      : '<p class="hint center">You both said yes. Say hello!</p>';
+    if (atBottom || data.length < 20) box.scrollTop = box.scrollHeight;
+    if (data.some(x => x.sender_id !== me)) sb.rpc("mark_read", { m: mid }).then(() => {}, () => {});
+  }
+
+  views.admin = async () => {
+    if (!isAdmin()) return '<div class="msg">This page is for administrators.</div>';
+    const [s, mem, rep] = await Promise.all([sb.rpc("admin_stats"), sb.rpc("admin_members"), sb.rpc("admin_reports")]);
+    if (s.error) return `<div class="msg">Couldn't load the numbers. Try again in a minute.</div>`;
+    const d = s.data, days = d.visits_by_day || [], top = Math.max(1, ...days.map(x => x.visitors));
+    const stat = (n, label) => `<div class="stat"><strong>${n}</strong><span>${label}</span></div>`;
+    return `
+      <h2>Admin</h2>
+      <p class="sub">Updated when you open this page.</p>
+      <h3>Visitors</h3>
+      <div class="stats">${stat(d.visitors_today, "visitors today")}${stat(d.visitors_7d, "visitors, 7 days")}${stat(d.visits_7d, "page views, 7 days")}</div>
+      ${days.length ? `<div class="bars" role="img" aria-label="Visitors per day, last 14 days">${days.map(x => `<div title="${x.day}: ${x.visitors}"><i style="height:${Math.max(4, (x.visitors / top) * 100)}%"></i><small>${new Date(x.day + "T12:00:00").getDate()}</small></div>`).join("")}</div>` : '<p class="hint">No visits recorded yet.</p>'}
+      <h3>Members</h3>
+      <div class="stats">
+        ${stat(d.accounts, "accounts")}${stat(d.accounts_7d, "new this week")}${stat(d.profiles_complete, "complete profiles")}
+        ${stat(d.founders + "/100", "founders")}${stat(d.paid, "paid")}${stat(d.questionnaires, "finished 20 questions")}
+        ${stat(d.women, "women")}${stat(d.men, "men")}${stat(d.in_pool, "in matching today")}
+        ${stat(d.tulsa_area, "Oklahoma")}${stat(d.outside, "outside Oklahoma")}${stat(d.confirmed, "emails confirmed")}
+      </div>
+      <h3>Activity</h3>
+      <div class="stats">${stat(d.intros_today, "introductions today")}${stat(d.matches, "active matches")}${stat(d.messages_7d, "messages, 7 days")}</div>
+      <h3>Reports ${d.open_reports ? `<b class="dot">${d.open_reports}</b>` : ""}</h3>
+      ${(rep.data || []).length ? rep.data.map(r => `<div class="card"><p><strong>${esc(r.reported_name || "Member")}</strong> (${esc(r.reported)})<br><span class="hint">Reported by ${esc(r.reporter)} on ${fmtDate(r.created_at)}</span></p><p>${esc(r.reason)}</p><button class="btn ghost" data-resolve="${r.id}">Mark handled</button></div>`).join("") : '<p class="hint">No open reports.</p>'}
+      <h3>Member list</h3>
+      ${(mem.data || []).map(u => `<div class="card member">
+        <p><strong>${esc(u.first_name || "(no profile yet)")}</strong>${u.founder ? ` · Founder #${u.founder}` : ""}${u.admin ? " · Admin" : ""}<br>
+        <span class="hint">${esc(u.email)} · ${esc([u.city, u.state].filter(Boolean).join(", ") || "no town")} · joined ${fmtDate(u.joined)}</span><br>
+        <span class="hint">${u.confirmed ? "Email confirmed" : "Email not confirmed"} · ${u.complete ? "Profile complete" : "Profile incomplete"} · ${u.quiz ? "20 questions done" : "Questions not done"}${u.paid_until ? ` · Paid until ${fmtDate(u.paid_until)}` : ""}${u.last_seen ? ` · Last seen ${fmtDate(u.last_seen)}` : ""}</span></p>
+        ${u.admin ? "" : `<div class="row tight"><button class="btn ghost" data-paid="${u.id}" data-days="30">Give 30 days free</button>${u.paid_until ? `<button class="btn ghost" data-paid="${u.id}" data-days="0">Remove paid time</button>` : ""}</div>`}
+      </div>`).join("")}`;
   };
 
   function authForm(mode) {
     const up = mode === "up";
     return `
       <h2>${up ? "Create your account" : "Welcome back"}</h2>
-      <p class="sub">${up ? "Takes about two minutes. Then your profile and 20 questions." : "Sign in to continue."}</p>
+      <p class="sub">${up ? "Takes about two minutes. Then your profile, photo and 20 questions." : "Sign in to continue."}</p>
       <form id="authf" data-mode="${mode}" novalidate>
         <label for="em">Email</label><input id="em" type="email" autocomplete="email" required>
         <label for="pw">Password ${up ? '<span class="hint">(at least 8 characters)</span>' : ""}</label>
         <input id="pw" type="password" autocomplete="${up ? "new-password" : "current-password"}" required>
-        ${up ? `<label class="hint" style="display:flex;gap:10px;align-items:flex-start;font-weight:400"><input id="agree" type="checkbox" style="width:auto;margin-top:5px"> <span>I'm ${C.minAge} or older and agree to the <a href="terms.html">Terms</a>, <a href="acceptable-use.html">Acceptable Use Policy</a> and <a href="privacy.html">Privacy Policy</a>.</span></label>` : ""}
+        ${up ? `<label class="hint agree"><input id="agree" type="checkbox"> <span>I'm ${C.minAge} or older and agree to the <a href="terms.html">Terms</a>, <a href="acceptable-use.html">Acceptable Use Policy</a> and <a href="privacy.html">Privacy Policy</a>.</span></label>` : ""}
         <p class="err" id="err" role="alert"></p>
         <div class="row"><button class="btn" type="submit">${up ? "Create account" : "Sign in"}</button>
           <a class="btn ghost" href="#/${up ? "signin" : "signup"}">${up ? "I already have an account" : "Create an account"}</a></div>
@@ -204,31 +474,106 @@
   }
 
   // ---------- render / routing ----------
-  const PRIVATE = ["home", "profile", "questions"], PUBLIC_ONLY = ["signup", "signin", "forgot"];
-  function render() {
+  const PRIVATE = ["home", "profile", "questions", "membership", "matches", "chat", "admin"], PUBLIC_ONLY = ["signup", "signin", "forgot"];
+  async function render() {
+    const id = ++renderId;
     let r = route();
     if (recovering) r = "newpass";
     if (!views[r]) r = "";
     if (PRIVATE.includes(r) && !session) { location.hash = "#/signin"; return; }
     if (PUBLIC_ONLY.includes(r) && session) { location.hash = "#/home"; return; }
     if (r === "" && session) { location.hash = "#/home"; return; }
-    if (r === "questions" && !profileDone()) { toast("Finish your profile first"); location.hash = "#/profile"; return; }
+    if (r === "questions" && !profileDone()) { toast("Finish your profile and photo first"); location.hash = "#/profile"; return; }
+    if (r === "questions" && !memberActive()) { location.hash = "#/membership"; return; }
+    if (r === "membership" && !profileDone()) { location.hash = "#/profile"; return; }
+    if (r !== "chat") stopChat();
+    logVisit(r);
     renderNav();
-    app.innerHTML = views[r]();
+    const out = views[r]();
+    if (out && typeof out.then === "function") app.innerHTML = '<p class="loading">Loading…</p>';
+    const html = await out;
+    if (id !== renderId) return; // a newer page was opened meanwhile
+    app.innerHTML = html;
     app.focus({ preventScroll: true });
-    window.scrollTo(0, 0);
+    if (r !== "chat") window.scrollTo(0, 0);
+    if (views[r].after) await views[r].after();
   }
   window.addEventListener("hashchange", render);
 
   // ---------- events ----------
   document.addEventListener("click", async e => {
-    const out = e.target.closest('[data-act="out"]');
-    if (out) { await sb.auth.signOut(); return; }
+    const t = e.target;
+    if (t.closest('[data-act="out"]')) { await sb.auth.signOut(); return; }
 
-    const seg = e.target.closest(".seg button");
+    if (t.closest('[data-act="delete"]')) {
+      if (!confirm("Delete your account? Your profile, photo, answers, matches and messages will be permanently removed. This can't be undone.")) return;
+      if (profile && profile.photo_path) await sb.storage.from("photos").remove([profile.photo_path]);
+      const { error } = await sb.rpc("delete_my_account");
+      if (error) { toast("We couldn't delete your account. Please try again."); return; }
+      await sb.auth.signOut(); toast("Your account has been deleted");
+      return;
+    }
+
+    const seg = t.closest(".seg button");
     if (seg) { seg.parentElement.querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", String(b === seg))); return; }
 
-    const ans = e.target.closest("[data-ans]");
+    const yes = t.closest("[data-yes]"), pass = t.closest("[data-pass]");
+    if (yes || pass) {
+      const b = yes || pass, intro = +(yes ? yes.dataset.yes : pass.dataset.pass);
+      b.closest(".row").querySelectorAll("button").forEach(x => x.disabled = true);
+      const { data, error } = await sb.rpc("respond", { intro, choice: yes ? "interested" : "passed" });
+      if (error) { toast("That didn't save. Please try again."); render(); return; }
+      if (data && data.matched) { toast("It's a match! Messaging is open."); refreshUnread(); location.hash = "#/chat?m=" + data.match_id; return; }
+      toast(yes ? "We'll let you know if it's mutual" : "Passed"); render();
+      return;
+    }
+
+    const gl = t.closest("[data-glint]");
+    if (gl) {
+      gl.disabled = true;
+      const { data, error } = await sb.rpc("send_glint", { target: gl.dataset.glint });
+      const msg = error ? "That didn't send. Please try again." : ({ sent: `Glint sent to ${gl.dataset.name}`, already_sent: "You've already sent a glint", daily_limit: "You can send one glint a day. Try again tomorrow." }[data] || "That didn't send.");
+      toast(msg);
+      if (data === "sent" || data === "already_sent") gl.outerHTML = `<span class="hint">${HEART} Glint sent</span>`; else gl.disabled = false;
+      return;
+    }
+
+    const rp = t.closest("[data-report]");
+    if (rp) {
+      const reason = prompt(`Report ${rp.dataset.name}. What happened? (Up to ${C.textLimit} characters.) This also removes them from your introductions and matches.`);
+      if (!reason || !reason.trim()) return;
+      const { error } = await sb.rpc("report_user", { target: rp.dataset.report, reason: reason.trim().slice(0, C.textLimit) });
+      toast(error ? "The report didn't send. Please try again." : "Thank you. Our team will review it.");
+      if (!error) go(route() === "chat" ? "matches" : "home");
+      return;
+    }
+
+    const um = t.closest("[data-unmatch]");
+    if (um) {
+      if (!confirm(`Unmatch ${um.dataset.name}? Your conversation will close for both of you and you won't be introduced again.`)) return;
+      const { error } = await sb.rpc("unmatch", { m: +um.dataset.unmatch });
+      toast(error ? "That didn't work. Please try again." : "Unmatched");
+      if (!error) go("matches");
+      return;
+    }
+
+    const rs = t.closest("[data-resolve]");
+    if (rs) {
+      rs.disabled = true;
+      const { error } = await sb.from("reports").update({ resolved_at: new Date().toISOString() }).eq("id", +rs.dataset.resolve);
+      toast(error ? "Couldn't update. Try again." : "Marked handled"); render();
+      return;
+    }
+
+    const pd = t.closest("[data-paid]");
+    if (pd) {
+      pd.disabled = true;
+      const { error } = await sb.rpc("admin_set_paid", { target: pd.dataset.paid, days: +pd.dataset.days });
+      toast(error ? "Couldn't update. Try again." : (+pd.dataset.days ? "Added 30 days" : "Paid time removed")); render();
+      return;
+    }
+
+    const ans = t.closest("[data-ans]");
     if (ans) {
       const [qid, val] = ans.dataset.ans.split(":"), i = +ans.dataset.i;
       ans.parentElement.querySelectorAll("button").forEach(b => { b.setAttribute("aria-pressed", String(b === ans)); b.disabled = true; });
@@ -243,8 +588,8 @@
       }
       const wasDone = quizDone();
       quiz = data;
-      if (complete && !wasDone) { toast("All 20 answered"); go("home"); return; }
-      if (complete) { // reviewing answers: step through, then back home
+      if (complete && !wasDone) { toast("All 20 answered. Here are your introductions."); go("home"); return; }
+      if (complete) {
         if (i < Q.length) location.hash = "#/questions?q=" + (i + 1); else { toast("Answers saved"); go("home"); }
         return;
       }
@@ -253,11 +598,36 @@
     }
   });
 
-  document.addEventListener("change", e => {
-    if (e.target.id === "loc") {
-      const other = e.target.value === "__other";
+  document.addEventListener("change", async e => {
+    const t = e.target;
+    if (t.id === "loc") {
+      const other = t.value === "__other";
       $("otherloc").hidden = !other;
       if (other) $("oc").focus();
+    }
+    if (t.id === "photoin" && t.files && t.files[0]) {
+      const file = t.files[0], msg = $("photomsg");
+      if (!/^image\//.test(file.type)) { msg.textContent = "Please choose a photo."; return; }
+      msg.textContent = "Uploading…";
+      try {
+        const blob = await resizeImage(file);
+        const uid = session.user.id, path = `${uid}/profile-${Date.now()}.jpg`;
+        const up = await sb.storage.from("photos").upload(path, blob, { contentType: "image/jpeg", upsert: true });
+        if (up.error) throw up.error;
+        const old = profile && profile.photo_path, wasDone = profileDone();
+        const { data, error } = await sb.from("profiles").upsert({ id: uid, photo_path: path }).select().single();
+        if (error) throw error;
+        if (old && old !== path) sb.storage.from("photos").remove([old]).then(() => {}, () => {});
+        profile = data;
+        $("myphoto").innerHTML = avatar({ first_name: profile.first_name, photo_path: path, founder: isFounder() }, 120);
+        hydratePhotos($("myphoto"));
+        msg.textContent = "Photo saved.";
+        document.querySelector('label[for="photoin"]').textContent = "Change photo";
+        if (!wasDone && profileDone()) afterComplete();
+      } catch (err) {
+        msg.textContent = "That photo didn't upload. Try a different one, or check your connection.";
+      }
+      t.value = "";
     }
   });
   document.addEventListener("input", e => {
@@ -265,16 +635,34 @@
     if (t.id === "bm" || t.id === "bdd" || t.id === "by") {
       t.value = t.value.replace(/\D/g, "");
       const next = { bm: "bdd", bdd: "by" }[t.id];
-      if (next && t.value.length === 2) $(next).focus(); // jump to the next box
+      if (next && t.value.length === 2) $(next).focus();
       return;
     }
-    if (e.target.id === "bio") $("cnt").textContent = e.target.value.length + "/" + C.textLimit;
+    if (t.id === "bio" || t.id === "body") $("cnt").textContent = t.value.length + "/" + C.textLimit;
   });
+
+  function afterComplete() {
+    if (isFounder()) { toast(`Welcome, Founding Member #${profile.founder_number}!`); go("membership"); }
+    else if (memberActive()) go(quizDone() ? "home" : "questions");
+    else go("membership");
+  }
 
   document.addEventListener("submit", async e => {
     e.preventDefault();
     const f = e.target, err = $("err"), btn = f.querySelector('button[type="submit"]');
-    err.textContent = "";
+    if (err) err.textContent = "";
+
+    if (f.id === "sendf") {
+      const box = $("body"), body = box.value.trim(), mid = +f.dataset.m;
+      if (!body) return;
+      busy(btn, true, "Sending…");
+      const { error } = await sb.from("messages").insert({ match_id: mid, sender_id: session.user.id, body: body.slice(0, C.textLimit) });
+      busy(btn, false);
+      if (error) { err.textContent = "Your message didn't send. This match may have ended, or check your connection."; return; }
+      box.value = ""; $("cnt").textContent = "0/" + C.textLimit;
+      await loadMessages(mid);
+      return;
+    }
 
     if (f.id === "authf") {
       const up = f.dataset.mode === "up", em = $("em").value.trim().toLowerCase(), pw = $("pw").value;
@@ -289,9 +677,9 @@
       busy(btn, false);
       if (res.error) { err.textContent = friendly(res.error); return; }
       if (up && !res.data.session) {
-        app.innerHTML = `<h2>Check your email</h2><p class="sub">We sent a confirmation link to <strong>${esc(em)}</strong>. Tap it, then come back and sign in.</p><div class="row"><a class="btn" href="#/signin">Go to sign in</a></div>`;
+        app.innerHTML = `<h2>Check your email</h2><p class="sub">We sent a confirmation link to <strong>${esc(em)}</strong>. Tap it, then come back and sign in. If you don't see it in a few minutes, check your spam folder.</p><div class="row"><a class="btn" href="#/signin">Go to sign in</a></div>`;
       }
-      return; // onAuthStateChange takes it from here
+      return;
     }
 
     if (f.id === "forgotf") {
@@ -334,12 +722,14 @@
       if (!city || !state) { err.textContent = loc === "__other" ? "Enter your city and state." : "Choose your town."; return; }
       if (bio.length < 20) { err.textContent = "Write at least a sentence or two for your bio."; return; }
       busy(btn, true, "Saving…");
+      const wasDone = profileDone();
       const { data, error } = await sb.from("profiles").upsert({ id: session.user.id, first_name, birthdate, gender, seeking, city, state, bio }).select().single();
       busy(btn, false);
       if (error) { err.textContent = "We couldn't save your profile. Please try again."; return; }
-      const firstTime = !profileDone();
-      profile = data; toast("Profile saved");
-      go(firstTime && !quizDone() ? "questions" : "home");
+      profile = data;
+      if (!profile.photo_path) { toast("Saved. Now add your photo."); $("photomsg").textContent = "Add a photo to finish your profile."; $("photomsg").classList.add("err"); document.querySelector(".photo-edit").scrollIntoView({ behavior: "smooth" }); return; }
+      toast("Profile saved");
+      if (!wasDone && profileDone()) afterComplete(); else go("home");
     }
   });
 
@@ -348,13 +738,15 @@
     const changed = (s && s.user.id) !== (session && session.user.id);
     session = s;
     if (event === "PASSWORD_RECOVERY") recovering = true;
-    if (event === "SIGNED_OUT") { profile = null; quiz = null; recovering = false; location.hash = "#/"; renderNav(); render(); return; }
-    if (changed) setTimeout(async () => { await loadMine(); render(); }, 0);
+    if (event === "SIGNED_OUT") { profile = null; quiz = null; recovering = false; unread = 0; stopChat(); location.hash = "#/"; render(); return; }
+    if (changed) setTimeout(async () => { await loadMine(); render(); refreshUnread(); }, 0);
   });
   (async () => {
     const { data } = await sb.auth.getSession();
     session = data.session;
     await loadMine();
     render();
+    refreshUnread();
+    setInterval(() => { if (route() !== "chat" && document.visibilityState === "visible") refreshUnread(); }, 60000);
   })();
 })();
