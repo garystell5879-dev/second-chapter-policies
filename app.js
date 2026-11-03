@@ -285,6 +285,7 @@
         <label><input type="checkbox" data-pref="email_glints"${p.email_glints === false ? "" : " checked"}> Someone sends me a glint</label>
       </div>
       <p class="hint">We never put your messages in emails, only that you have one. If you're on the site, we don't email you about new messages.</p>
+      <p><a href="safety.html">Safety tips for meeting in person</a></p>
       <p class="hint">Signed in as ${esc(session.user.email)}</p>
       <div class="row"><button type="button" class="btn ghost" data-act="out">Sign out</button></div>
       ${quizDone() ? '<p><a href="#/questions?q=1">Review your 20 answers</a></p>' : ""}
@@ -518,7 +519,8 @@
         <label for="em">Email</label><input id="em" type="email" autocomplete="email" required>
         <label for="pw">Password ${up ? '<span class="hint">(at least 8 characters)</span>' : ""}</label>
         <input id="pw" type="password" autocomplete="${up ? "new-password" : "current-password"}" required>
-        ${up ? `<label class="hint agree"><input id="agree" type="checkbox"> <span>I'm ${C.minAge} or older and agree to the <a href="terms.html">Terms</a>, <a href="acceptable-use.html">Acceptable Use Policy</a> and <a href="privacy.html">Privacy Policy</a>.</span></label>` : ""}
+        ${up ? `<label class="hint agree"><input id="agree" type="checkbox"> <span>I'm ${C.minAge} or older, I agree to the <a href="terms.html">Terms</a>, <a href="acceptable-use.html">Acceptable Use Policy</a> and <a href="privacy.html">Privacy Policy</a>, and I understand that Second Chapter does not run criminal background checks on members.</span></label>
+        <p class="notice">SECOND CHAPTER DOES NOT CONDUCT CRIMINAL BACKGROUND SCREENINGS OF ITS MEMBERS. Please read our <a href="safety.html">safety tips</a> before meeting anyone.</p>` : ""}
         <p class="err" id="err" role="alert"></p>
         <div class="row"><button class="btn" type="submit">${up ? "Create account" : "Sign in"}</button>
           <a class="btn ghost" href="#/${up ? "signin" : "signup"}">${up ? "I already have an account" : "Create an account"}</a></div>

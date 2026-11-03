@@ -181,3 +181,5 @@ body.has-tabs .toast{bottom:calc(88px + env(safe-area-inset-bottom,0))}
 .toggles label{display:flex;gap:12px;align-items:center;font-weight:400;margin:0;padding:8px 0}
 .toggles input{width:22px;height:22px;accent-color:var(--crimson);flex:none}
 .account h3{margin-top:0}
+
+.notice{font-weight:700;font-size:15px;line-height:1.45;border:2px solid var(--crimson);border-radius:12px;padding:12px 14px;margin:16px 0 0}
