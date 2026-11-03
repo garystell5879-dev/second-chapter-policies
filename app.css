@@ -175,3 +175,9 @@ h4{font:600 24px/1.15 "Cormorant Garamond",Georgia,serif;margin:0}
 @media (max-width:380px){.stats{grid-template-columns:repeat(2,1fr)}.plans{grid-template-columns:1fr}}
 
 body.has-tabs .toast{bottom:calc(88px + env(safe-area-inset-bottom,0))}
+
+/* v4 */
+.toggles{display:flex;flex-direction:column;gap:4px;margin:6px 0 10px}
+.toggles label{display:flex;gap:12px;align-items:center;font-weight:400;margin:0;padding:8px 0}
+.toggles input{width:22px;height:22px;accent-color:var(--crimson);flex:none}
+.account h3{margin-top:0}

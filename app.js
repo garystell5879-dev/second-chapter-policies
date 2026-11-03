@@ -11,6 +11,24 @@
 
   let session = null, profile = null, quiz = null, recovering = false, renderId = 0, chatChannel = null, chatPoll = null, unread = 0;
 
+  // ---------- problem logging (shows on the Admin page) ----------
+  const seenErr = new Set();
+  function logErr(where, err) {
+    try {
+      const msg = String((err && (err.message || err.reason && err.reason.message)) || err || "unknown").slice(0, 400);
+      const key = where + "|" + msg;
+      if (seenErr.has(key) || seenErr.size > 8) return; seenErr.add(key);
+      sb.from("client_errors").insert({
+        page: (location.hash || "#/").slice(0, 120), message: (where + ": " + msg).slice(0, 500),
+        detail: String((err && err.stack) || "").slice(0, 2000), agent: navigator.userAgent.slice(0, 300)
+      }).then(() => {}, () => {});
+    } catch (e) {}
+  }
+  window.addEventListener("error", e => logErr("script", e.error || e.message));
+  window.addEventListener("unhandledrejection", e => logErr("promise", e.reason));
+  let lastTouch = 0;
+  function touch() { if (session && Date.now() - lastTouch > 120000) { lastTouch = Date.now(); sb.rpc("touch").then(() => {}, () => {}); } }
+
   // ---------- helpers ----------
   const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const $ = id => document.getElementById(id);
@@ -260,13 +278,34 @@
       <div class="row"><button class="btn" type="submit">${profileDone() ? "Save changes" : "Save and continue"}</button></div>
     </form>
     <div class="account">
+      <h3>Email me when</h3>
+      <div class="toggles">
+        <label><input type="checkbox" data-pref="email_matches"${p.email_matches === false ? "" : " checked"}> Someone matches with me</label>
+        <label><input type="checkbox" data-pref="email_messages"${p.email_messages === false ? "" : " checked"}> A match sends me a message</label>
+        <label><input type="checkbox" data-pref="email_glints"${p.email_glints === false ? "" : " checked"}> Someone sends me a glint</label>
+      </div>
+      <p class="hint">We never put your messages in emails, only that you have one. If you're on the site, we don't email you about new messages.</p>
       <p class="hint">Signed in as ${esc(session.user.email)}</p>
       <div class="row"><button type="button" class="btn ghost" data-act="out">Sign out</button></div>
       ${quizDone() ? '<p><a href="#/questions?q=1">Review your 20 answers</a></p>' : ""}
+      <p><a href="#/feedback">Report a problem</a></p>
       <p><button type="button" class="linkbtn danger" data-act="delete">Delete my account</button></p>
     </div>`;
   };
   views.profile.after = () => hydratePhotos();
+
+  views.feedback = () => `
+    <h2>Report a problem</h2>
+    <p class="sub">Something not working, confusing, or wrong? Tell us what happened and we'll look into it.</p>
+    <form id="feedbackf" novalidate>
+      <label for="fb">What happened?</label>
+      <textarea id="fb" maxlength="${C.textLimit}" placeholder="For example: I tapped Save and nothing happened."></textarea>
+      <div class="count" id="cnt">0/${C.textLimit}</div>
+      ${session ? "" : `<label for="fbc">Your email <span class="hint">(optional, if you'd like a reply)</span></label><input id="fbc" type="email" maxlength="120" autocomplete="email">`}
+      <p class="err" id="err" role="alert"></p>
+      <div class="row"><button class="btn" type="submit">Send</button><a class="btn ghost" href="#/${session ? "home" : ""}">Cancel</a></div>
+    </form>
+    <p class="hint">For safety concerns about a member, use the Report button on their profile. In an emergency, call 911.</p>`;
 
   views.membership = () => {
     const p = profile || {};
@@ -329,6 +368,7 @@
       return setupSteps();
     }
     const { data, error } = await sb.rpc("my_introductions");
+    if (error) logErr("introductions", error);
     if (error) return `<div class="msg">We couldn't load your introductions. Pull down to refresh, or try again in a minute.</div>`;
     const today = data.filter(x => x.section === "today" && x.card), cart = data.filter(x => x.section === "cart" && x.card);
     const away = profile.state && !/^(ok|oklahoma)$/i.test(profile.state.trim());
@@ -366,6 +406,7 @@
 
   views.matches = async () => {
     const { data, error } = await sb.rpc("my_matches");
+    if (error) logErr("matches", error);
     if (error) return `<div class="msg">We couldn't load your matches. Try again in a minute.</div>`;
     unread = data.reduce((n, m) => n + (+m.unread || 0), 0);
     return `
@@ -426,7 +467,12 @@
 
   views.admin = async () => {
     if (!isAdmin()) return '<div class="msg">This page is for administrators.</div>';
-    const [s, mem, rep] = await Promise.all([sb.rpc("admin_stats"), sb.rpc("admin_members"), sb.rpc("admin_reports")]);
+    const since = new Date(Date.now() - 7 * 864e5).toISOString();
+    const [s, mem, rep, ex, fb, er] = await Promise.all([sb.rpc("admin_stats"), sb.rpc("admin_members"), sb.rpc("admin_reports"), sb.rpc("admin_extra"),
+      sb.from("feedback").select("id,page,message,contact,created_at").is("resolved_at", null).order("created_at", { ascending: false }).limit(50),
+      sb.from("client_errors").select("message,page,created_at").gte("created_at", since).order("created_at", { ascending: false }).limit(300)]);
+    const x = ex.data || {}, errs = {};
+    (er.data || []).forEach(e => { const k = e.message; (errs[k] = errs[k] || { n: 0, last: e.created_at, page: e.page }).n++; });
     if (s.error) return `<div class="msg">Couldn't load the numbers. Try again in a minute.</div>`;
     const d = s.data, days = d.visits_by_day || [], top = Math.max(1, ...days.map(x => x.visitors));
     const stat = (n, label) => `<div class="stat"><strong>${n}</strong><span>${label}</span></div>`;
@@ -445,6 +491,13 @@
       </div>
       <h3>Activity</h3>
       <div class="stats">${stat(d.intros_today, "introductions today")}${stat(d.matches, "active matches")}${stat(d.messages_7d, "messages, 7 days")}</div>
+      <h3>Emails</h3>
+      <div class="stats">${stat(x.emails_sent_7d ?? 0, "alerts sent, 7 days")}${stat(x.emails_unsent_7d ?? 0, "couldn't send, 7 days")}</div>
+      ${x.emails_unsent_7d ? '<p class="hint">Emails can\'t send until the Resend setup is finished.</p>' : ""}
+      <h3>Problems reported ${x.open_feedback ? `<b class="dot">${x.open_feedback}</b>` : ""}</h3>
+      ${(fb.data || []).length ? fb.data.map(f => `<div class="card"><p>${esc(f.message)}</p><p class="hint">${fmtDate(f.created_at)} · on ${esc(f.page || "#/")}${f.contact ? ` · reply to ${esc(f.contact)}` : ""}</p><button class="btn ghost" data-fbdone="${f.id}">Mark handled</button></div>`).join("") : '<p class="hint">No open problem reports.</p>'}
+      <h3>Site errors, last 7 days</h3>
+      ${Object.keys(errs).length ? Object.entries(errs).map(([m, v]) => `<div class="card"><p><strong>${v.n}×</strong> ${esc(m)}</p><p class="hint">Last ${fmtDate(v.last)} · on ${esc(v.page || "#/")}</p></div>`).join("") + '<p class="hint">Tell Claude "check the site errors" and it can look these up and fix them.</p>' : '<p class="hint">No errors recorded.</p>'}
       <h3>Reports ${d.open_reports ? `<b class="dot">${d.open_reports}</b>` : ""}</h3>
       ${(rep.data || []).length ? rep.data.map(r => `<div class="card"><p><strong>${esc(r.reported_name || "Member")}</strong> (${esc(r.reported)})<br><span class="hint">Reported by ${esc(r.reporter)} on ${fmtDate(r.created_at)}</span></p><p>${esc(r.reason)}</p><button class="btn ghost" data-resolve="${r.id}">Mark handled</button></div>`).join("") : '<p class="hint">No open reports.</p>'}
       <h3>Member list</h3>
@@ -487,7 +540,7 @@
     if (r === "questions" && !memberActive()) { location.hash = "#/membership"; return; }
     if (r === "membership" && !profileDone()) { location.hash = "#/profile"; return; }
     if (r !== "chat") stopChat();
-    logVisit(r);
+    logVisit(r); touch();
     renderNav();
     const out = views[r]();
     if (out && typeof out.then === "function") app.innerHTML = '<p class="loading">Loading…</p>';
@@ -498,7 +551,8 @@
     if (r !== "chat") window.scrollTo(0, 0);
     if (views[r].after) await views[r].after();
   }
-  window.addEventListener("hashchange", render);
+  let prevHash = "#/";
+  window.addEventListener("hashchange", e => { try { prevHash = new URL(e.oldURL).hash || "#/"; } catch (x) {} render(); });
 
   // ---------- events ----------
   document.addEventListener("click", async e => {
@@ -522,7 +576,7 @@
       const b = yes || pass, intro = +(yes ? yes.dataset.yes : pass.dataset.pass);
       b.closest(".row").querySelectorAll("button").forEach(x => x.disabled = true);
       const { data, error } = await sb.rpc("respond", { intro, choice: yes ? "interested" : "passed" });
-      if (error) { toast("That didn't save. Please try again."); render(); return; }
+      if (error) { logErr("respond", error); toast("That didn't save. Please try again."); render(); return; }
       if (data && data.matched) { toast("It's a match! Messaging is open."); refreshUnread(); location.hash = "#/chat?m=" + data.match_id; return; }
       toast(yes ? "We'll let you know if it's mutual" : "Passed"); render();
       return;
@@ -557,6 +611,14 @@
       return;
     }
 
+    const fd = t.closest("[data-fbdone]");
+    if (fd) {
+      fd.disabled = true;
+      const { error } = await sb.from("feedback").update({ resolved_at: new Date().toISOString() }).eq("id", +fd.dataset.fbdone);
+      toast(error ? "Couldn't update. Try again." : "Marked handled"); render();
+      return;
+    }
+
     const rs = t.closest("[data-resolve]");
     if (rs) {
       rs.disabled = true;
@@ -582,6 +644,7 @@
       const row = { user_id: session.user.id, answers, completed_at: complete ? (quiz.completed_at || new Date().toISOString()) : null };
       const { data, error } = await sb.from("questionnaire").upsert(row).select().single();
       if (error) {
+        logErr("save answer", error);
         ans.parentElement.querySelectorAll("button").forEach(b => b.disabled = false);
         $("err").textContent = "We couldn't save that answer. Check your connection and tap it again.";
         return;
@@ -600,6 +663,13 @@
 
   document.addEventListener("change", async e => {
     const t = e.target;
+    if (t.dataset && t.dataset.pref) {
+      const field = t.dataset.pref, val = t.checked;
+      const { error } = await sb.from("profiles").update({ [field]: val }).eq("id", session.user.id);
+      if (error) { t.checked = !val; logErr("email setting", error); toast("That didn't save. Please try again."); return; }
+      profile[field] = val; toast(val ? "Emails on" : "Emails off");
+      return;
+    }
     if (t.id === "loc") {
       const other = t.value === "__other";
       $("otherloc").hidden = !other;
@@ -625,6 +695,7 @@
         document.querySelector('label[for="photoin"]').textContent = "Change photo";
         if (!wasDone && profileDone()) afterComplete();
       } catch (err) {
+        logErr("photo upload", err);
         msg.textContent = "That photo didn't upload. Try a different one, or check your connection.";
       }
       t.value = "";
@@ -638,7 +709,7 @@
       if (next && t.value.length === 2) $(next).focus();
       return;
     }
-    if (t.id === "bio" || t.id === "body") $("cnt").textContent = t.value.length + "/" + C.textLimit;
+    if (t.id === "bio" || t.id === "body" || t.id === "fb") $("cnt").textContent = t.value.length + "/" + C.textLimit;
   });
 
   function afterComplete() {
@@ -652,13 +723,24 @@
     const f = e.target, err = $("err"), btn = f.querySelector('button[type="submit"]');
     if (err) err.textContent = "";
 
+    if (f.id === "feedbackf") {
+      const msg = $("fb").value.trim(), contact = $("fbc") ? $("fbc").value.trim() : "";
+      if (msg.length < 3) { err.textContent = "Tell us a little about what happened."; return; }
+      busy(btn, true, "Sending…");
+      const { error } = await sb.from("feedback").insert({ message: msg.slice(0, C.textLimit), contact: contact.slice(0, 120) || null, page: prevHash.slice(0, 120) });
+      busy(btn, false);
+      if (error) { err.textContent = "That didn't send. Please try again, or email support@joinsecondchapter.com."; return; }
+      app.innerHTML = `<h2>Thank you</h2><p class="sub">We got your message and will look into it.</p><div class="row"><a class="btn" href="#/${session ? "home" : ""}">Back</a></div>`;
+      return;
+    }
+
     if (f.id === "sendf") {
       const box = $("body"), body = box.value.trim(), mid = +f.dataset.m;
       if (!body) return;
       busy(btn, true, "Sending…");
       const { error } = await sb.from("messages").insert({ match_id: mid, sender_id: session.user.id, body: body.slice(0, C.textLimit) });
       busy(btn, false);
-      if (error) { err.textContent = "Your message didn't send. This match may have ended, or check your connection."; return; }
+      if (error) { logErr("send message", error); err.textContent = "Your message didn't send. This match may have ended, or check your connection."; return; }
       box.value = ""; $("cnt").textContent = "0/" + C.textLimit;
       await loadMessages(mid);
       return;
@@ -725,7 +807,7 @@
       const wasDone = profileDone();
       const { data, error } = await sb.from("profiles").upsert({ id: session.user.id, first_name, birthdate, gender, seeking, city, state, bio }).select().single();
       busy(btn, false);
-      if (error) { err.textContent = "We couldn't save your profile. Please try again."; return; }
+      if (error) { logErr("save profile", error); err.textContent = "We couldn't save your profile. Please try again."; return; }
       profile = data;
       if (!profile.photo_path) { toast("Saved. Now add your photo."); $("photomsg").textContent = "Add a photo to finish your profile."; $("photomsg").classList.add("err"); document.querySelector(".photo-edit").scrollIntoView({ behavior: "smooth" }); return; }
       toast("Profile saved");
