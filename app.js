@@ -76,15 +76,76 @@
 
   // ---------- photos ----------
   const urlCache = {};
-  async function photoUrl(path) {
+  async function photoUrl(path, bucket) {
+    bucket = bucket || "photos";
     if (!path) return null;
     if (path.startsWith("samples/")) return path;
-    const hit = urlCache[path];
+    const key = bucket + ":" + path, hit = urlCache[key];
     if (hit && hit.exp > Date.now()) return hit.url;
-    const { data, error } = await sb.storage.from("photos").createSignedUrl(path, 3600);
+    const { data, error } = await sb.storage.from(bucket).createSignedUrl(path, 3600);
     if (error || !data) return null;
-    urlCache[path] = { url: data.signedUrl, exp: Date.now() + 50 * 60 * 1000 };
+    urlCache[key] = { url: data.signedUrl, exp: Date.now() + 50 * 60 * 1000 };
     return data.signedUrl;
+  }
+  function hydrateBooth(root) {
+    (root || document).querySelectorAll("[data-booth]").forEach(async el => {
+      const path = el.dataset.booth; el.removeAttribute("data-booth");
+      const url = await photoUrl(path, "booth");
+      if (url) el.innerHTML = `<a href="${url}" target="_blank" rel="noopener"><img src="${url}" alt="Photo booth picture"></a>`;
+    });
+  }
+
+  // ---------- server programs (payments, photo booth) ----------
+  async function fn(name, body) {
+    try {
+      const { data, error } = await sb.functions.invoke(name, { body });
+      if (error) {
+        let detail = null;
+        try { detail = error.context && typeof error.context.json === "function" ? await error.context.json() : null; } catch (e) {}
+        return { data: detail, error };
+      }
+      return { data, error: null };
+    } catch (e) { return { data: null, error: e }; }
+  }
+  let billingCfg = null, boothCfgV = null;
+  async function getBilling() {
+    if (billingCfg) return billingCfg;
+    const { data, error } = await fn("billing", { action: "status" });
+    const v = !error && data && data.configured ? data : { configured: false };
+    if (!error) billingCfg = v;
+    return v;
+  }
+  async function boothCfg() {
+    if (boothCfgV) return boothCfgV;
+    const { data, error } = await fn("booth", { action: "status" });
+    const v = !error && data && data.configured ? data : { configured: false };
+    if (!error) boothCfgV = v;
+    return v;
+  }
+  const PRICES = { week: "$9.99 a week", month: "$36 a month" };
+  function memberStatus() {
+    const p = profile || {};
+    const live = p.sub_id && ["active", "trialing", "past_due"].includes(p.sub_status);
+    if (live) {
+      const price = PRICES[p.sub_plan] || "your plan's price";
+      if (p.sub_status === "past_due") return `<p><strong>Your last payment didn't go through.</strong> Update your card to keep your membership.</p>`;
+      if (p.sub_cancel_at_period_end) return `<p><strong>Canceled.</strong> You keep access until ${fmtDate(p.paid_until)}, and you won't be charged again.</p>`;
+      if (p.sub_status === "trialing") return `<p><strong>Free until ${fmtDate(p.paid_until)}</strong>, then ${price}, renewing automatically until you cancel.</p>`;
+      return `<p><strong>Member.</strong> ${price}, renews ${fmtDate(p.paid_until)}.</p>`;
+    }
+    if (isFounder() && memberActive() && !isAdmin()) return `<p><strong>Founding member #${p.founder_number}.</strong> Free until ${fmtDate(p.founder_free_until)}. Choose a plan before then to keep your introductions coming.</p>`;
+    if (p.paid_until && new Date(p.paid_until) > new Date()) return `<p><strong>Member</strong> through ${fmtDate(p.paid_until)}.</p>`;
+    if (isAdmin()) return `<p><strong>Administrator.</strong> No membership needed.</p>`;
+    return `<p>No active membership.</p>`;
+  }
+  function memberButtons() {
+    const p = profile || {}, b = [];
+    const live = p.sub_id && ["active", "trialing", "past_due"].includes(p.sub_status);
+    if (live && !p.sub_cancel_at_period_end) b.push('<button type="button" class="btn ghost" data-bill="cancel">Cancel membership</button>');
+    if (live && p.sub_cancel_at_period_end) b.push('<button type="button" class="btn ghost" data-bill="resume">Keep my membership</button>');
+    if (p.stripe_customer_id) b.push('<button type="button" class="btn ghost" data-bill="portal">Update card or see receipts</button>');
+    if (!live && profileDone() && !isAdmin()) b.push('<a class="btn ghost" href="#/membership">Choose a plan</a>');
+    return b.length ? `<div class="row tight">${b.join("")}</div>` : "";
   }
   // Fill every [data-photo] placeholder on the page with its picture.
   function hydratePhotos(root) {
@@ -278,6 +339,12 @@
       <div class="row"><button class="btn" type="submit">${profileDone() ? "Save changes" : "Save and continue"}</button></div>
     </form>
     <div class="account">
+      ${profileDone() ? `<h3>Membership</h3>${memberStatus()}${memberButtons()}` : ""}
+      <h3>Photo booth</h3>
+      <div class="toggles">
+        <label><input type="checkbox" data-pref="booth_ok"${p.booth_ok ? " checked" : ""}> Let my matches and me make AI pictures of the two of us together</label>
+      </div>
+      <p class="hint">Off unless you turn it on. Both people in a match must turn it on. Pictures use each person's profile photo, carry a Second Chapter watermark, and are deleted for both of you if you unmatch.</p>
       <h3>Email me when</h3>
       <div class="toggles">
         <label><input type="checkbox" data-pref="email_matches"${p.email_matches === false ? "" : " checked"}> Someone matches with me</label>
@@ -308,27 +375,56 @@
     </form>
     <p class="hint">For safety concerns about a member, use the Report button on their profile. In an emergency, call 911.</p>`;
 
-  views.membership = () => {
+  views.membership = async () => {
     const p = profile || {};
-    if (isFounder() && memberActive()) return `
-      <h2>You're a founding member</h2>
-      <div class="founder-row big">${avatar({ first_name: p.first_name, photo_path: p.photo_path, founder: true }, 110)}
-        <div><strong>Founder #${p.founder_number}</strong><br>Free until ${fmtDate(p.founder_free_until)}</div></div>
-      <p>Your badge shows on your profile to everyone you're introduced to. After your free months, membership is $9.99 a week or $36 a month, and you'll add a payment method then.</p>
-      <div class="row"><a class="btn" href="#/${quizDone() ? "home" : "questions"}">${quizDone() ? "Back to today" : "Continue to the 20 questions"}</a></div>`;
-    const lapsed = (p.founder_free_until || p.paid_until) && !memberActive();
-    return `
-      <h2>${lapsed ? "Renew your membership" : "Choose your membership"}</h2>
-      <p class="sub">${lapsed ? "Your membership has ended. Renew to keep getting introductions." : "All 100 founder spots have been claimed. Membership unlocks the 20 questions and your daily introductions."}</p>
+    if (param("paid") === "1") return `<h2>Finishing up…</h2><p class="sub">We're confirming your payment with Stripe. This usually takes a few seconds.</p><p class="loading" id="paidwait">Waiting for confirmation…</p>`;
+    const billing = await getBilling();
+    const live = p.sub_id && ["active", "trialing", "past_due"].includes(p.sub_status);
+    const nextDate = isFounder() && memberActive() ? p.founder_free_until : (p.paid_until && new Date(p.paid_until) > new Date() ? p.paid_until : null);
+    const plans = billing.configured ? `
+      <label class="hint agree"><input id="renew" type="checkbox"> <span>I understand my membership renews automatically at the price I choose, every week or every month, until I cancel. I can cancel anytime from my Profile page and keep access until the end of the period I paid for. No refunds for partial periods.${nextDate ? ` I won't be charged until ${fmtDate(nextDate)}.` : ""}</span></label>
+      <div class="plans">
+        <div class="card plan"><strong>$9.99</strong><span>per week</span><button class="btn" data-plan="week">Choose weekly</button></div>
+        <div class="card plan best"><em>Best value</em><strong>$36</strong><span>per month</span><button class="btn" data-plan="month">Choose monthly</button></div>
+      </div>
+      <p class="err" id="err" role="alert"></p>
+      <p class="hint">Payment is handled securely by Stripe. See <a href="pricing.html">pricing</a> and <a href="refunds.html">refunds</a>.</p>` : `
       <div class="plans">
         <div class="card plan"><strong>$9.99</strong><span>per week</span><button class="btn" disabled>Coming soon</button></div>
         <div class="card plan best"><em>Best value</em><strong>$36</strong><span>per month</span><button class="btn" disabled>Coming soon</button></div>
       </div>
       <div class="msg">Online payment is opening shortly. Your profile is saved, so you can come back and pick up right here.</div>
-      <p class="hint">Cancel anytime. No refunds for partial periods. See <a href="pricing.html">pricing</a> and <a href="refunds.html">refunds</a>.</p>
-      ${p.paid_until ? `<p class="hint">Paid through ${fmtDate(p.paid_until)}.</p>` : ""}`;
+      <p class="hint">Cancel anytime. No refunds for partial periods. See <a href="pricing.html">pricing</a> and <a href="refunds.html">refunds</a>.</p>`;
+    if (live) return `
+      <h2>Your membership</h2>${memberStatus()}
+      <div class="row"><a class="btn" href="#/${quizDone() ? "home" : "questions"}">${quizDone() ? "Back to today" : "Continue to the 20 questions"}</a><a class="btn ghost" href="#/profile">Manage membership</a></div>`;
+    if (isFounder() && memberActive()) return `
+      <h2>You're a founding member</h2>
+      <div class="founder-row big">${avatar({ first_name: p.first_name, photo_path: p.photo_path, founder: true }, 110)}
+        <div><strong>Founder #${p.founder_number}</strong><br>Free until ${fmtDate(p.founder_free_until)}</div></div>
+      <p>Your badge shows on your profile to everyone you're introduced to.</p>
+      <div class="row"><a class="btn" href="#/${quizDone() ? "home" : "questions"}">${quizDone() ? "Back to today" : "Continue to the 20 questions"}</a></div>
+      <h3>After your free months</h3>
+      <p>Membership is $9.99 a week or $36 a month. ${billing.configured ? "You can pick a plan now and won't be charged until your free time ends, or come back any time before then." : "You'll be able to pick a plan here before your free time ends."}</p>
+      ${billing.configured ? plans : ""}`;
+    const lapsed = (p.founder_free_until || p.paid_until) && !memberActive();
+    return `
+      <h2>${lapsed ? "Renew your membership" : "Choose your membership"}</h2>
+      <p class="sub">${lapsed ? "Your membership has ended. Renew to keep getting introductions." : "All 100 founder spots have been claimed. Membership unlocks the 20 questions and your daily introductions."}</p>
+      ${plans}`;
   };
-  views.membership.after = () => hydratePhotos();
+  views.membership.after = async () => {
+    hydratePhotos();
+    if (param("paid") !== "1") return;
+    for (let i = 0; i < 15; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      if (route() !== "membership") return;
+      await loadMine();
+      if (profile && profile.sub_id) { toast("You're all set. Thank you!"); go(quizDone() ? "home" : "questions"); return; }
+    }
+    const w = $("paidwait");
+    if (w) w.innerHTML = 'Stripe has your payment, but our confirmation is running slow. <a href="#/profile">Check your membership</a> in a minute, or <a href="#/feedback">tell us</a> if it doesn\'t show up.';
+  };
 
   views.questions = () => {
     const a = (quiz && quiz.answers) || {};
@@ -420,7 +516,7 @@
           <div class="end"><small>${fmtTime(m.last_at)}</small>${+m.unread ? `<b class="dot">${m.unread}</b>` : ""}</div>
         </a>`).join("") : `<div class="card"><h4>No matches yet</h4><p>When you say yes to an introduction and they say yes too, they'll show up here.</p><div class="row"><a class="btn" href="#/home">See today's introductions</a></div></div>`}`;
   };
-  views.matches.after = () => { hydratePhotos(); renderTabs(); };
+  views.matches.after = () => { hydratePhotos(); renderTabs(); if (param("credits") === "1") toast("Thank you! Your pictures will be added in a moment."); };
 
   views.chat = async () => {
     const mid = +param("m");
@@ -434,7 +530,7 @@
           <button type="button" data-unmatch="${mid}" data-name="${esc(c.first_name)}">Unmatch</button>
           <button type="button" data-report="${c.id}" data-name="${esc(c.first_name)}">Report ${esc(c.first_name)}</button>
         </div></details></div>
-      <div class="booth card"><strong>Photo booth</strong><span class="hint">Coming soon: describe a scene and get a picture of the two of you together.</span></div>
+      <div id="booth" class="booth card" data-m="${mid}" data-name="${esc(c.first_name)}"><strong>Photo booth</strong><span class="hint">Loading…</span></div>
       <div id="msgs" class="msgs" aria-live="polite"><p class="hint">Loading…</p></div>
       <form id="sendf" class="sendf" data-m="${mid}" novalidate>
         <label for="body" class="sr">Message</label>
@@ -447,8 +543,12 @@
     hydratePhotos();
     const mid = +param("m"); if (!$("msgs")) return;
     await loadMessages(mid);
+    renderBooth();
     stopChat();
-    chatChannel = sb.channel("m" + mid).on("postgres_changes", { event: "INSERT", schema: "public", table: "messages", filter: "match_id=eq." + mid }, () => loadMessages(mid)).subscribe();
+    chatChannel = sb.channel("m" + mid)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages", filter: "match_id=eq." + mid }, () => loadMessages(mid))
+      .on("postgres_changes", { event: "*", schema: "public", table: "booth_images", filter: "match_id=eq." + mid }, () => loadMessages(mid))
+      .subscribe();
     chatPoll = setInterval(() => { if (route() === "chat") loadMessages(mid); }, 15000);
   };
   function stopChat() {
@@ -457,13 +557,54 @@
   }
   async function loadMessages(mid) {
     const box = $("msgs"); if (!box) return;
-    const { data, error } = await sb.from("messages").select("id,sender_id,body,created_at").eq("match_id", mid).order("created_at", { ascending: true }).limit(500);
-    if (error) { box.innerHTML = '<p class="hint">Messages couldn\'t load. Check your connection.</p>'; return; }
-    const me = session.user.id, atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-    box.innerHTML = data.length ? data.map(x => `<div class="bubble${x.sender_id === me ? " mine" : ""}"><p>${esc(x.body)}</p><small>${fmtTime(x.created_at)}</small></div>`).join("")
-      : '<p class="hint center">You both said yes. Say hello!</p>';
-    if (atBottom || data.length < 20) box.scrollTop = box.scrollHeight;
+    const [msgs, pics] = await Promise.all([
+      sb.from("messages").select("id,sender_id,body,created_at").eq("match_id", mid).order("created_at", { ascending: true }).limit(500),
+      sb.from("booth_images").select("id,creator_id,path,status,created_at").eq("match_id", mid).order("created_at", { ascending: true }).limit(200)]);
+    if (msgs.error) { logErr("messages", msgs.error); box.innerHTML = '<p class="hint">Messages couldn\'t load. Check your connection.</p>'; return; }
+    const me = session.user.id, data = msgs.data;
+    const items = data.map(x => ({ t: x.created_at, k: "m", x })).concat((pics.data || [])
+      .filter(x => x.status !== "failed" || x.creator_id === me).map(x => ({ t: x.created_at, k: "b", x })))
+      .sort((a, b) => (a.t < b.t ? -1 : 1));
+    const sig = items.map(i => i.k + i.x.id + (i.x.status || "")).join(",");
+    if (box.dataset.sig === sig) return;
+    box.dataset.sig = sig;
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+    box.innerHTML = items.length ? items.map(i => {
+      const x = i.x;
+      if (i.k === "m") return `<div class="bubble${x.sender_id === me ? " mine" : ""}"><p>${esc(x.body)}</p><small>${fmtTime(x.created_at)}</small></div>`;
+      const mine = x.creator_id === me ? " mine" : "";
+      if (x.status === "done") return `<div class="bubble photo${mine}"><div class="bimg" data-booth="${esc(x.path)}"><span class="hint">Loading picture…</span></div><small>Photo booth · ${fmtTime(x.created_at)}</small></div>`;
+      if (x.status === "pending") return `<div class="bubble photo${mine}"><p class="hint">Creating a photo booth picture… this can take up to a minute.</p></div>`;
+      return `<div class="bubble photo mine"><p class="hint">That picture couldn't be made. Your free picture or credit wasn't used.</p></div>`;
+    }).join("") : '<p class="hint center">You both said yes. Say hello!</p>';
+    hydrateBooth(box);
+    if (atBottom || items.length < 20) box.scrollTop = box.scrollHeight;
     if (data.some(x => x.sender_id !== me)) sb.rpc("mark_read", { m: mid }).then(() => {}, () => {});
+  }
+
+  async function renderBooth() {
+    const el = $("booth"); if (!el) return;
+    const mid = +el.dataset.m, name = el.dataset.name;
+    const [st, cfg, bill] = await Promise.all([sb.rpc("booth_state", { m: mid }), boothCfg(), getBilling()]);
+    const s = st.data;
+    if (!$("booth")) return;
+    if (st.error || !s) { el.hidden = true; return; }
+    const packs = bill.configured
+      ? `<div class="row tight"><button type="button" class="btn ghost" data-pack="p5">5 pictures · $4.99</button><button type="button" class="btn ghost" data-pack="p12">12 pictures · $9.99</button></div>`
+      : '<p class="hint">Extra picture packs are coming soon.</p>';
+    let inner;
+    if (!s.me_ok) inner = `<span class="hint">${cfg.configured ? "" : "Opening soon. "}Make AI pictures of you and ${name} together: describe a scene and the booth creates it. Both of you need to turn it on.</span>
+      <div class="row tight"><button type="button" class="btn ghost" data-boothon>Turn on the photo booth</button></div>`;
+    else if (!s.them_ok) inner = `<span class="hint">You've turned it on. Waiting for ${name} to turn it on too.</span>`;
+    else if (!cfg.configured) inner = `<span class="hint">You're both set. The photo booth is opening soon; your first picture with ${name} will be free.</span>`;
+    else {
+      const canMake = s.free_left || s.credits > 0;
+      inner = `<span class="hint">${s.free_left ? `Your first picture with ${name} is free.` : s.credits > 0 ? `Uses 1 credit. You have ${s.credits}.` : `You've used your free picture with ${name}. Get more:`}</span>
+        ${canMake ? `<label for="scene" class="sr">Describe a scene</label><textarea id="scene" maxlength="${C.textLimit}" rows="2" placeholder="Describe a scene, like: dancing at an outdoor summer concert"></textarea>
+        <div class="sendrow"><span class="count" id="scnt">0/${C.textLimit}</span><button type="button" class="btn" data-boothgo="${mid}">Create picture</button></div>` : ""}
+        ${canMake && s.credits === 0 ? "" : packs}`;
+    }
+    el.innerHTML = `<strong>Photo booth</strong>${inner}<p class="err" id="berr" role="alert"></p>`;
   }
 
   views.admin = async () => {
@@ -480,6 +621,8 @@
     return `
       <h2>Admin</h2>
       <p class="sub">Updated when you open this page.</p>
+      <h3>Payments and photo booth</h3>
+      <div class="card" id="setupstatus"><p class="hint">Checking…</p></div>
       <h3>Visitors</h3>
       <div class="stats">${stat(d.visitors_today, "visitors today")}${stat(d.visitors_7d, "visitors, 7 days")}${stat(d.visits_7d, "page views, 7 days")}</div>
       ${days.length ? `<div class="bars" role="img" aria-label="Visitors per day, last 14 days">${days.map(x => `<div title="${x.day}: ${x.visitors}"><i style="height:${Math.max(4, (x.visitors / top) * 100)}%"></i><small>${new Date(x.day + "T12:00:00").getDate()}</small></div>`).join("")}</div>` : '<p class="hint">No visits recorded yet.</p>'}
@@ -508,6 +651,16 @@
         <span class="hint">${u.confirmed ? "Email confirmed" : "Email not confirmed"} · ${u.complete ? "Profile complete" : "Profile incomplete"} · ${u.quiz ? "20 questions done" : "Questions not done"}${u.paid_until ? ` · Paid until ${fmtDate(u.paid_until)}` : ""}${u.last_seen ? ` · Last seen ${fmtDate(u.last_seen)}` : ""}</span></p>
         ${u.admin ? "" : `<div class="row tight"><button class="btn ghost" data-paid="${u.id}" data-days="30">Give 30 days free</button>${u.paid_until ? `<button class="btn ghost" data-paid="${u.id}" data-days="0">Remove paid time</button>` : ""}</div>`}
       </div>`).join("")}`;
+  };
+
+  views.admin.after = async () => {
+    const el = $("setupstatus"); if (!el) return;
+    billingCfg = null; boothCfgV = null;
+    const [b, bo] = await Promise.all([getBilling(), boothCfg()]);
+    el.innerHTML = `
+      <p><strong>Payments:</strong> ${!b.configured ? "not switched on yet (waiting for the Stripe key)." : b.connected ? "on and connected to Stripe." : "key added. One more tap to connect Stripe:"}</p>
+      ${b.configured && !b.connected ? '<div class="row tight"><button type="button" class="btn" data-connect>Connect Stripe</button></div>' : ""}
+      <p><strong>Photo booth:</strong> ${bo.configured ? "on." : "not switched on yet (waiting for the image service key)."}</p>`;
   };
 
   function authForm(mode) {
@@ -613,6 +766,88 @@
       return;
     }
 
+    const pl = t.closest("[data-plan]");
+    if (pl) {
+      const err = $("err");
+      if (!$("renew").checked) { err.textContent = "Please check the box to confirm you understand how renewal works."; return; }
+      busy(pl, true, "Opening checkout…");
+      const { data, error } = await fn("billing", { action: "checkout", plan: pl.dataset.plan });
+      if (data && data.url) { location.href = data.url; return; }
+      busy(pl, false);
+      if (error) logErr("checkout", error);
+      err.textContent = data && data.error === "already_subscribed" ? "You already have a membership. You can manage it from your Profile page."
+        : data && data.configured === false ? "Online payment isn't open yet. Please check back soon."
+        : "Checkout didn't open. Please try again in a minute.";
+      return;
+    }
+
+    const bl = t.closest("[data-bill]");
+    if (bl) {
+      const act = bl.dataset.bill;
+      if (act === "cancel" && !confirm(`Cancel your membership? You'll keep access until ${fmtDate(profile.paid_until)} and won't be charged again.`)) return;
+      busy(bl, true);
+      const { data, error } = await fn("billing", { action: act });
+      if (act === "portal" && data && data.url) { location.href = data.url; return; }
+      busy(bl, false);
+      if (error || !data || data.error) { logErr("billing " + act, error || data && data.error); toast("That didn't work. Please try again in a minute."); return; }
+      await loadMine();
+      toast(act === "cancel" ? "Membership canceled. No more charges." : "Your membership will continue.");
+      render();
+      return;
+    }
+
+    const pk = t.closest("[data-pack]");
+    if (pk) {
+      busy(pk, true, "Opening checkout…");
+      const { data, error } = await fn("billing", { action: "credits", pack: pk.dataset.pack });
+      if (data && data.url) { location.href = data.url; return; }
+      busy(pk, false);
+      if (error) logErr("credits checkout", error);
+      toast("Checkout didn't open. Please try again in a minute.");
+      return;
+    }
+
+    if (t.closest("[data-boothon]")) {
+      const { error } = await sb.from("profiles").update({ booth_ok: true }).eq("id", session.user.id);
+      if (error) { logErr("booth on", error); toast("That didn't save. Please try again."); return; }
+      profile.booth_ok = true; toast("Photo booth on"); renderBooth();
+      return;
+    }
+
+    const bg = t.closest("[data-boothgo]");
+    if (bg) {
+      const berr = $("berr"), scene = ($("scene").value || "").trim();
+      berr.textContent = "";
+      if (scene.length < 3) { berr.textContent = "Describe the scene you'd like, in a few words."; return; }
+      busy(bg, true, "Starting…");
+      const mid = +bg.dataset.boothgo;
+      const { data, error } = await sb.rpc("start_booth", { m: mid, scene: scene.slice(0, C.textLimit) });
+      if (error || !data || data.error) {
+        busy(bg, false);
+        if (error) logErr("start booth", error);
+        berr.textContent = ({ no_credits: "You're out of pictures for now. Get a pack below.", busy: "You already have a picture being made. Give it a minute.",
+          daily_limit: "You've reached today's limit of 20 pictures. Try again tomorrow.", they_not_opted_in: "The other person has turned the photo booth off.",
+          you_not_opted_in: "Turn on the photo booth in your Profile first.", too_short: "Describe the scene in a few more words.", not_matched: "This match has ended." }[data && data.error]) || "That didn't start. Please try again.";
+        return;
+      }
+      $("scene").value = "";
+      await loadMessages(mid);
+      renderBooth();
+      const res = await fn("booth", { action: "make", id: data.id });
+      if (res.data && res.data.error === "not_configured") toast("The photo booth is opening soon. Nothing was used.");
+      else if (res.error || !res.data || !res.data.ok) { logErr("booth make", res.error || res.data && res.data.message); toast("That picture couldn't be made. Nothing was used."); }
+      if ($("msgs")) { await loadMessages(mid); renderBooth(); }
+      return;
+    }
+
+    if (t.closest("[data-connect]")) {
+      const b = t.closest("[data-connect]"); busy(b, true, "Connecting…");
+      const { data, error } = await fn("billing", { action: "connect" });
+      if (error || !data || !data.ok) { busy(b, false); logErr("connect stripe", error || data && data.message); toast("Couldn't connect to Stripe. Check that the key is right."); return; }
+      toast(data.livemode ? "Stripe connected" : "Stripe connected in test mode"); render();
+      return;
+    }
+
     const fd = t.closest("[data-fbdone]");
     if (fd) {
       fd.disabled = true;
@@ -669,7 +904,7 @@
       const field = t.dataset.pref, val = t.checked;
       const { error } = await sb.from("profiles").update({ [field]: val }).eq("id", session.user.id);
       if (error) { t.checked = !val; logErr("email setting", error); toast("That didn't save. Please try again."); return; }
-      profile[field] = val; toast(val ? "Emails on" : "Emails off");
+      profile[field] = val; toast(field === "booth_ok" ? (val ? "Photo booth on" : "Photo booth off") : (val ? "Emails on" : "Emails off"));
       return;
     }
     if (t.id === "loc") {
@@ -711,6 +946,7 @@
       if (next && t.value.length === 2) $(next).focus();
       return;
     }
+    if (t.id === "scene") { $("scnt").textContent = t.value.length + "/" + C.textLimit; return; }
     if (t.id === "bio" || t.id === "body" || t.id === "fb") $("cnt").textContent = t.value.length + "/" + C.textLimit;
   });
 
